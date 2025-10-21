@@ -63,13 +63,16 @@ class TrendStrategy:
         caution = None
 
         # Simple crossover with mild band to avoid whipsaw
-        band = slow * 0.0002  # ~2bps of price level
-        if fast > slow * (1.0 + band):
-            side = "long"; reason = "fast_above_slow"
-        elif fast < slow * (1.0 - band):
-            side = "short"; reason = "fast_below_slow"
-        else:
-            side = "wait"; reason = "near_equilibrium"
+-        band = slow * 0.0002  # ~2bps of price level
+-        if fast > slow * (1.0 + band):
++        band_pct = 0.0002  # ~2 bps
++        if fast > slow * (1.0 + band_pct):
+             side = "long"; reason = "fast_above_slow"
+-        elif fast < slow * (1.0 - band):
++        elif fast < slow * (1.0 - band_pct):
+             side = "short"; reason = "fast_below_slow"
+         else:
+             side = "wait"; reason = "near_equilibrium"
 
         # Extra caution after a sudden jump
         if atrp > 0.01:
