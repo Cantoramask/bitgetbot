@@ -50,8 +50,9 @@ class DataFeeder:
             try:
                 t = await self.adapter.fetch_ticker()
                 self._ticks.append(Tick(ts_ms=int(t["ts"]), price=float(t["price"])))
-            except Exception:
-                pass
+            except Exception as e:
+                # 👇 don't swallow silently — emit one-line hint
+                print(f"[FEEDER] backfill tick error: {e}")
             await asyncio.sleep(0.1)
 
         while not self._stop.is_set():
@@ -60,9 +61,9 @@ class DataFeeder:
                 ts = int(t.get("ts") or t.get("timestamp") or int(time.time()*1000))
                 price = float(t["price"])
                 self._ticks.append(Tick(ts_ms=ts, price=price))
-            except Exception:
-                # swallow, try next
-                pass
+            except Exception as e:
+                # 👇 log and keep going so you know why nothing moves
+                print(f"[FEEDER] poll error: {e}")
             await asyncio.sleep(self.poll_sec)
 
     def last_price(self) -> Optional[float]:
