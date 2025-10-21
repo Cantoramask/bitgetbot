@@ -116,6 +116,18 @@ class Orchestrator:
                 raw = await self.adapter.get_open_position()
                 if raw and raw.get("symbol") == self.cfg.symbol:
                     self._position = Position(**raw)  # type: ignore[arg-type]
+                    # sync leverage to the actual position so risk & future orders match reality
+                    try:
+                        self.cfg.leverage = int(self._position.leverage)
+                    except Exception:
+                        pass
+                    self.adapter.leverage = int(self.cfg.leverage)
+                    self._apply_leverage_tighten(int(self.cfg.leverage))
+                    if self.adapter.live:
+                        try:
+                            await asyncio.to_thread(self.adapter.ex.set_leverage, self.adapter.leverage, self.adapter.symbol)
+                        except Exception as se:
+                            self.jlog.warn("set_leverage_warn", error=str(se))
                     self.risk.set_last_side(self._position.side)
                     self.jlog.heartbeat(status="takeover", side=self._position.side, size_usdt=self._position.size_usdt, lev=self._position.leverage)
                 else:
@@ -161,7 +173,7 @@ class Orchestrator:
     def _make_params_from_vol_profile(self, vol: str) -> Params:
         v = (vol or "Medium").lower()
         if v == "high":
-            base = Params(0.006, 0.003, 10, max(5, getattr(self.cfg, "intelligence_check_sec", 10)), 20, 0.002, 0.02, 0.001, 0.01, 5, 50, 3, 30, 5, 180)
+            base = Params(0.006, 0.003, 10, max(5, getattr(self.cfg, "intelligence_check_sec", 10)), 20, 0.003, 0.02, 0.0015, 0.012, 5, 50, 3, 30, 5, 180)
         elif v == "low":
             base = Params(0.010, 0.006, 20, max(8, getattr(self.cfg, "intelligence_check_sec", 10)), 40, 0.002, 0.03, 0.001, 0.02, 5, 50, 3, 30, 5, 180)
         else:
