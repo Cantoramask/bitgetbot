@@ -1,208 +1,310 @@
 #!/usr/bin/env python3
-# bitgetbot/bitget_adapter.py
+# bitgetbot/orchestrator.py
 """
-bitget_adapter.py
-Live Bitget adapter using ccxt with USDT perpetuals.
+orchestrator.py
+Central conductor wired to your exchange adapter and advisor in the paths defined by your project structure doc.
 
-Plain English summary.
-This is the part that talks to the exchange for real. It sets leverage and margin mode, checks your open position, gets the latest price, opens and closes market orders, and converts your USDT stake into the correct contract amount with the exchange’s precision and minimums.
-
-New words defined once.
-Precision means how many decimals the exchange allows for price or amount. Lot size means the smallest chunk you are allowed to trade. Reduce-only means the order can only decrease or close a position, never open a bigger one.
+Plain English.
+This is the pilot. It starts tasks, tunes settings inside fences, checks risk, asks the advisor if enabled, writes a clean audit trail, and saves a tiny state so it can continue smoothly. It now imports exchange/adapter.py and ai/reasoner.py so the only setup you need is your .env.
 """
 
 from __future__ import annotations
 
 import asyncio
-import math
-import os
 import time
-from typing import Any, Dict, Optional
+import random
+import contextlib
+from dataclasses import dataclass, asdict
+from typing import Optional
 
-import ccxt
+from state_store import StateStore, Journal
+from journal_logger import JournalLogger
+from risk_manager import RiskManager, RiskLimits
+from exchange.adapter import BitgetAdapter
+from ai.reasoner import Reasoner
 
 
-class BitgetAdapter:
-    def __init__(self, *, logger, symbol: str, leverage: int, margin_mode: str, live: bool):
-        self.log = logger
-        self.symbol = symbol  # normalized like BTC/USDT:USDT
-        self.live = bool(live)
-        self.leverage = int(leverage)
-        self.margin_mode = (margin_mode or "cross").lower()
+@dataclass
+class Position:
+    symbol: str
+    side: str
+    size_usdt: float
+    entry_price: float
+    leverage: int
+    contracts: float
 
-        api_key = os.getenv("BITGET_API_KEY", "")
-        api_secret = os.getenv("BITGET_API_SECRET", "")
-        api_pass = os.getenv("BITGET_API_PASSPHRASE", "")
 
-        if self.live and (not api_key or not api_secret or not api_pass):
-            raise RuntimeError("Missing Bitget API credentials in .env. Set BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE")
+@dataclass
+class Params:
+    trail_pct_init: float
+    trail_pct_tight: float
+    atr_len: int
+    intelligence_sec: int
+    reopen_cooldown_sec: int
+    min_trail_init: float
+    max_trail_init: float
+    min_trail_tight: float
+    max_trail_tight: float
+    min_atr_len: int
+    max_atr_len: int
+    min_intel_sec: int
+    max_intel_sec: int
+    min_cooldown: int
+    max_cooldown: int
 
-        self.ex = ccxt.bitget({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "password": api_pass,
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "swap",     # USDT perpetuals
-                "defaultSubType": "linear"
-            }
+
+class Orchestrator:
+    def __init__(self, cfg, logger):
+        self.cfg = cfg
+        self.logger = logger
+
+        self.state_store = StateStore("orchestrator")
+        self.events = Journal("events")
+        self.jlog = JournalLogger(self.logger, self.events)
+        self.risk = RiskManager(self.logger, RiskLimits())
+        self.reasoner = Reasoner()
+
+        self.adapter = BitgetAdapter(
+            logger=self.logger,
+            symbol=self.cfg.symbol,
+            leverage=self.cfg.leverage,
+            margin_mode=self.cfg.margin_mode,
+            live=self.cfg.live,
+        )
+
+        self._stop = asyncio.Event()
+        self._last_action_ts = 0.0
+        self._position: Optional[Position] = None
+        self._params = self._make_params_from_vol_profile(self.cfg.vol_profile)
+
+        self._wins = 0
+        self._losses = 0
+        self._success_rate = 0.5
+        self._last_price: Optional[float] = None
+
+    async def run(self):
+        await self.adapter.connect()
+        self.jlog.startup({
+            "symbol": self.cfg.symbol,
+            "live": self.cfg.live,
+            "leverage": self.cfg.leverage,
+            "margin": self.cfg.margin_mode,
+            "vol": self.cfg.vol_profile,
+            "takeover": self.cfg.takeover,
+            "advisor": "on" if self.reasoner.enabled else "off",
         })
-        self._market = None  # filled in connect()
 
-    async def connect(self):
-        await self._ensure_markets()
-        await self._ensure_symbol_ready()
-        self.log.info(f"[EX] Bitget live={self.live} lev={self.leverage} margin={self.margin_mode}")
-
-    async def _ensure_markets(self):
-        # ccxt is sync. Run it in a thread so we do not block asyncio.
-        def _load():
-            return self.ex.load_markets()
-        self._markets = await asyncio.to_thread(_load)
-
-    async def _ensure_symbol_ready(self):
-        sym = self.symbol
-        if sym not in self._markets:
-            # Try to normalise common inputs
-            if sym.endswith("USDT") and "/" not in sym:
-                sym = f"{sym[:-4]}/USDT:USDT"
-            elif "/" in sym and not sym.endswith(":USDT"):
-                sym = f"{sym}:USDT"
-            self.symbol = sym
-        self._market = self._markets[self.symbol]
-        # Set leverage and margin mode one time
-        if self.live:
+        if self.cfg.takeover:
             try:
-                await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
+                raw = await self.adapter.get_open_position()
+                if raw and raw.get("symbol") == self.cfg.symbol:
+                    self._position = Position(**raw)  # type: ignore[arg-type]
+                    self.risk.set_last_side(self._position.side)
+                    self.jlog.heartbeat(status="takeover", side=self._position.side, size_usdt=self._position.size_usdt, lev=self._position.leverage)
+                else:
+                    self.jlog.heartbeat(status="takeover_none")
             except Exception as e:
-                self.log.info(f"[EX] set_leverage warn: {e}")
-            try:
-                await asyncio.to_thread(self.ex.set_margin_mode, self.margin_mode, self.symbol)
-            except Exception as e:
-                self.log.info(f"[EX] set_margin_mode warn: {e}")
+                self.jlog.exception(e, where="takeover_check")
 
-    async def fetch_ticker(self) -> Dict[str, Any]:
-        def _fetch():
-            return self.ex.fetch_ticker(self.symbol)
-        t = await asyncio.to_thread(_fetch)
-        px = float(t.get("last", t.get("close", 0.0)))
-        if not px or not math.isfinite(px):
-            raise RuntimeError("Bad price from ticker")
-        return {"symbol": self.symbol, "price": px, "ts": t.get("timestamp", int(time.time() * 1000))}
+        tasks = [
+            asyncio.create_task(self._watch_market(), name="watch_market"),
+            asyncio.create_task(self._intelligence_cycle(), name="intelligence_cycle"),
+            asyncio.create_task(self._manage_position(), name="manage_position"),
+            asyncio.create_task(self._heartbeat(), name="heartbeat"),
+        ]
 
-    async def get_open_position(self) -> Optional[Dict[str, Any]]:
-        def _pos():
-            # Bitget returns a list. We filter by symbol.
-            pos = self.ex.fetch_positions([self.symbol])
-            return pos
         try:
-            rows = await asyncio.to_thread(_pos)
-        except Exception as e:
-            self.log.info(f"[EX] fetch_positions error: {e}")
-            return None
-        for r in rows or []:
-            if r.get("symbol") != self.symbol:
-                continue
-            amt = float(r.get("contracts", r.get("amount", 0)) or 0)
-            if abs(amt) < 1e-12:
-                continue
-            side = "long" if amt > 0 else "short"
-            entry = float(r.get("entryPrice") or r.get("entry_price") or 0.0)
-            lev = int(r.get("leverage") or self.leverage)
-            size_usdt = abs(amt) * entry
-            return {
-                "symbol": self.symbol,
-                "side": side,
-                "size_usdt": float(size_usdt),
-                "entry_price": float(entry),
-                "leverage": lev,
-                "contracts": abs(amt),
-            }
-        return None
+            await self._stop.wait()
+        finally:
+            for t in tasks:
+                t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(*tasks)
+            self._save_state()
+            self.jlog.shutdown()
 
-    def _amount_from_usdt(self, usdt: float, price: float) -> float:
-        # Convert a USDT stake into base amount, then fit precision and min limits.
-        amount = float(usdt) / max(1.0, float(price))
-        prec = self._market["precision"]["amount"]
-        step = 10 ** (-prec)
-        amount = math.floor(amount / step) * step
-        min_amt = float(self._market["limits"]["amount"]["min"] or 0)
-        if amount < min_amt:
-            amount = min_amt
-        return float(amount)
+    def request_stop(self):
+        self._stop.set()
 
-    async def place_order(self, side: str, usdt: float) -> Optional[Dict[str, Any]]:
-        t = await self.fetch_ticker()
-        price = float(t["price"])
-        amount = self._amount_from_usdt(usdt, price)
-        req_side = "buy" if side == "long" else "sell"
+    def _make_params_from_vol_profile(self, vol: str) -> Params:
+        v = (vol or "Medium").lower()
+        if v == "high":
+            base = Params(0.006, 0.003, 10, max(5, getattr(self.cfg, "intelligence_check_sec", 10)), 20, 0.002, 0.02, 0.001, 0.01, 5, 50, 3, 30, 5, 180)
+        elif v == "low":
+            base = Params(0.010, 0.006, 20, max(8, getattr(self.cfg, "intelligence_check_sec", 10)), 40, 0.002, 0.03, 0.001, 0.02, 5, 50, 3, 30, 5, 180)
+        else:
+            base = Params(0.008, 0.004, 14, getattr(self.cfg, "intelligence_check_sec", 10), 30, 0.002, 0.025, 0.001, 0.015, 5, 50, 3, 30, 5, 180)
+        return base
 
-        if not self.live:
-            # Paper fill
-            return {
-                "symbol": self.symbol,
-                "side": side,
-                "size_usdt": float(usdt),
-                "entry_price": price,
-                "leverage": self.leverage,
-                "contracts": amount,
-            }
+    def _clamp(self, val, lo, hi):
+        return max(lo, min(hi, val))
 
-        params = {"reduceOnly": False}
-        def _order():
-            return self.ex.create_order(self.symbol, "market", req_side, amount, None, params)
+    def _auto_tune_params(self):
+        sr = self._success_rate
+        drift = (sr - 0.5) * 0.2
+        new_trail_init = self._params.trail_pct_init * (1.0 - drift)
+        new_trail_tight = self._params.trail_pct_tight * (1.0 - drift)
+        new_atr_len = int(round(self._params.atr_len * (1.0 + (-drift))))
+        new_intel = int(round(self._params.intelligence_sec * (1.0 + (-drift * 0.5))))
+        new_cd = int(round(self._params.reopen_cooldown_sec * (1.0 + (0.5 - sr) * 0.5)))
+
+        self._params.trail_pct_init = self._clamp(new_trail_init, self._params.min_trail_init, self._params.max_trail_init)
+        self._params.trail_pct_tight = self._clamp(new_trail_tight, self._params.min_trail_tight, self._params.max_trail_tight)
+        self._params.atr_len = self._clamp(new_atr_len, self._params.min_atr_len, self._params.max_atr_len)
+        self._params.intelligence_sec = self._clamp(new_intel, self._params.min_intel_sec, self._params.max_intel_sec)
+        self._params.reopen_cooldown_sec = self._clamp(new_cd, self._params.min_cooldown, self._params.max_cooldown)
+
+        self.jlog.knob_change("trail_pct_init", round(new_trail_init, 5), self._params.trail_pct_init, "auto_tune")
+        self.jlog.knob_change("trail_pct_tight", round(new_trail_tight, 5), self._params.trail_pct_tight, "auto_tune")
+        self.jlog.knob_change("atr_len", new_atr_len, self._params.atr_len, "auto_tune")
+        self.jlog.knob_change("intelligence_sec", new_intel, self._params.intelligence_sec, "auto_tune")
+        self.jlog.knob_change("reopen_cooldown_sec", new_cd, self._params.reopen_cooldown_sec, "auto_tune")
+
+    async def _watch_market(self):
         try:
-            o = await asyncio.to_thread(_order)
+            while not self._stop.is_set():
+                t = await self.adapter.fetch_ticker()
+                self._last_price = float(t["price"])
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            self.log.info(f"[EX] create_order error: {e}")
-            return None
+            self.jlog.exception(e, where="watch_market")
 
-        # Best effort entry price from last or average
-        filled = float(o.get("filled", amount) or amount)
-        avg = float(o.get("average", price) or price)
-        size_usdt = filled * avg
-        return {
-            "symbol": self.symbol,
-            "side": side,
-            "size_usdt": float(size_usdt),
-            "entry_price": float(avg),
-            "leverage": self.leverage,
-            "contracts": filled,
-            "order": o,
+    async def _intelligence_cycle(self):
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(self._params.intelligence_sec)
+                self._success_rate = self._clamp(self._success_rate + random.uniform(-0.03, 0.03), 0.1, 0.9)
+                self._auto_tune_params()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.jlog.exception(e, where="intelligence_cycle")
+
+    async def _manage_position(self):
+        try:
+            while not self._stop.is_set():
+                now = time.time()
+                if now - self._last_action_ts < self._params.reopen_cooldown_sec:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                if self._position is None:
+                    side_choice = random.choice(["long", "short"])
+                    allowed, stake, info = self.risk.check_order(
+                        symbol=self.cfg.symbol,
+                        side=side_choice,
+                        requested_stake_usdt=float(self.cfg.stake_usdt),
+                        requested_leverage=int(self.cfg.leverage),
+                        vol_profile=self.cfg.vol_profile,
+                        now_ts=now,
+                        is_flip=None,
+                    )
+                    if not allowed:
+                        self.jlog.warn("risk_block_open", **info)
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    snapshot = {
+                        "price": self._last_price,
+                        "trail_init": self._params.trail_pct_init,
+                        "trail_tight": self._params.trail_pct_tight,
+                        "intel_sec": self._params.intelligence_sec,
+                        "stake": stake,
+                        "lev": self.cfg.leverage,
+                        "vol": self.cfg.vol_profile,
+                        "side": side_choice,
+                    }
+                    allow, conf, note = self.reasoner.evaluate(snapshot)
+                    if not allow:
+                        self.jlog.advisor(False, conf, note)
+                        await asyncio.sleep(1.0)
+                        continue
+                    self.jlog.advisor(True, conf, note)
+
+                    raw = await self.adapter.place_order(side=side_choice, usdt=stake)
+                    if not raw:
+                        self.jlog.warn("open_failed")
+                        await asyncio.sleep(1.0)
+                        continue
+                    self._position = Position(**raw)  # type: ignore[arg-type]
+                    self._last_action_ts = now
+                    self.risk.set_last_side(side_choice)
+                    self.jlog.trade_open(self.cfg.symbol, side_choice, stake, self._position.entry_price, self._position.leverage)
+                    self._save_state()
+                    continue
+
+                if self._position is not None:
+                    if self._last_price is None:
+                        await asyncio.sleep(0.5)
+                        continue
+
+                    pos = self._position
+                    direction = 1 if pos.side == "long" else -1
+                    change_pct = direction * (self._last_price - pos.entry_price) / max(1.0, pos.entry_price)
+                    trigger = self._params.trail_pct_tight * 0.5
+
+                    if abs(change_pct) >= trigger:
+                        pnl = await self.adapter.close_position(asdict(pos))
+                        self._position = None
+                        self._last_action_ts = time.time()
+                        self.risk.note_exit()
+
+                        if pnl is not None and pnl >= 0:
+                            self._wins += 1
+                        else:
+                            self._losses += 1
+                        total = max(1, self._wins + self._losses)
+                        self._success_rate = self._wins / total
+                        self.risk.register_fill(pnl_usdt=float(pnl or 0.0))
+                        self.jlog.trade_close(self.cfg.symbol, pos.side, pos.size_usdt, float(self._last_price), float(pnl or 0.0), self._wins, self._losses, self._success_rate)
+                        self._save_state()
+                    else:
+                        await asyncio.sleep(0.5)
+                else:
+                    await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.jlog.exception(e, where="manage_position")
+
+    async def _heartbeat(self):
+        try:
+            while not self._stop.is_set():
+                pos_txt = "none" if self._position is None else f"{self._position.side} {self._position.size_usdt:.2f}USDT @ {self._position.entry_price:.2f} x{self._position.leverage}"
+                self.jlog.heartbeat(
+                    price=self._last_price,
+                    pos=pos_txt,
+                    trail_init=round(self._params.trail_pct_init, 5),
+                    trail_tight=round(self._params.trail_pct_tight, 5),
+                    atr=self._params.atr_len,
+                    intel_sec=self._params.intelligence_sec,
+                    cd=self._params.reopen_cooldown_sec,
+                    sr=round(self._success_rate, 3),
+                )
+                self.events.rotate_keep_bytes(10_000_000)
+                self._save_state()
+                await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.jlog.exception(e, where="heartbeat")
+
+    def _save_state(self):
+        st = {
+            "symbol": self.cfg.symbol,
+            "live": self.cfg.live,
+            "leverage": self.cfg.leverage,
+            "margin_mode": self.cfg.margin_mode,
+            "vol_profile": self.cfg.vol_profile,
+            "takeover": self.cfg.takeover,
+            "params": asdict(self._params),
+            "wins": self._wins,
+            "losses": self._losses,
+            "success_rate": self._success_rate,
+            "position": asdict(self._position) if self._position else None,
+            "last_price": self._last_price,
+            "last_action_ts": self._last_action_ts,
         }
-
-    async def close_position(self, pos: Dict[str, Any]) -> Optional[float]:
-        # Close with reduce-only market order
-        amt = float(pos.get("contracts") or 0.0)
-        if amt <= 0:
-            # If contracts not known, derive from USDT and price
-            t = await self.fetch_ticker()
-            amt = self._amount_from_usdt(pos["size_usdt"], t["price"])
-
-        close_side = "sell" if pos["side"] == "long" else "buy"
-        params = {"reduceOnly": True}
-
-        if not self.live:
-            # Paper close
-            t = await self.fetch_ticker()
-            px = float(t["price"])
-            direction = 1 if pos["side"] == "long" else -1
-            pnl_pct = direction * (px - float(pos["entry_price"])) / max(1.0, float(pos["entry_price"]))
-            return float(pos["size_usdt"]) * pnl_pct
-
-        def _order():
-            return self.ex.create_order(self.symbol, "market", close_side, amt, None, params)
-        try:
-            o = await asyncio.to_thread(_order)
-        except Exception as e:
-            self.log.info(f"[EX] close_order error: {e}")
-            return None
-
-        # Compute realised PnL against average exit if available, else last
-        exit_px = float(o.get("average") or 0.0)
-        if exit_px <= 0:
-            t = await self.fetch_ticker()
-            exit_px = float(t["price"])
-        direction = 1 if pos["side"] == "long" else -1
-        pnl_pct = direction * (exit_px - float(pos["entry_price"])) / max(1.0, float(pos["entry_price"]))
-        return float(pos["size_usdt"]) * pnl_pct
+        self.state_store.save(st)
