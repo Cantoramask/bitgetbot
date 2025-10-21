@@ -80,6 +80,7 @@ class Orchestrator:
 
         self._params = self._make_params_from_vol_profile(self.cfg.vol_profile)
 
+        self.feeder = DataFeeder(self.adapter, window=1200, poll_sec=1.0)
         self.strategy = TrendStrategy(
             fast=20,
             slow=50,
@@ -129,7 +130,9 @@ class Orchestrator:
             if self.feeder.last_price() is not None:
                 break
             await asyncio.sleep(0.2)
+        self.logger.info("[DBG] feeder warm-up last_price=%s", str(self.feeder.last_price()))
         await self._infer_vol_profile(force=True)
+        self.logger.info("[DBG] regime after warm-up vol=%s params=%s", self.cfg.vol_profile, asdict(self._params))
 
         tasks = [
             asyncio.create_task(self._watch_market(), name="watch_market"),
