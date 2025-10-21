@@ -246,54 +246,58 @@ async def _async_main():
     default_margin = os.getenv("MARGIN_MODE", "cross")
     default_vol = _normalize_vol(os.getenv("VOL_PROFILE", "Medium"))
 
-    # Try to detect open positions (one or many) for a meaningful prompt/selection
-    detected = []
+    # Detect real open positions FIRST; only ask to take over if there are any
+    chosen_symbol = None
+    open_positions = []
     try:
         tmp_adapter = BitgetAdapter(
-            logger=_setup_logging(),
+            logger=logging.getLogger("bitgetbot-boot"),
             symbol=default_symbol,
             leverage=int(default_lev),
             margin_mode=default_margin,
             live=default_live_env,
         )
         await tmp_adapter.connect()
-        # NEW: get all open positions, not just one
+        # requires API keys; returns [] if none
         if hasattr(tmp_adapter, "get_all_open_positions"):
-            detected = await tmp_adapter.get_all_open_positions()
+            open_positions = await tmp_adapter.get_all_open_positions()
         else:
-            # Back-compat: fall back to single get_open_position
-            pos = await tmp_adapter.get_open_position()
-            if pos:
-                detected = [pos]
+            # backwards fallback: check just default_symbol
+            raw = await tmp_adapter.get_open_position()
+            open_positions = [raw] if raw else []
     except Exception:
-        pass
+        open_positions = []
 
-    chosen_symbol = None
-    if detected:
-        if len(detected) == 1:
-            chosen_symbol = str(detected[0].get("symbol") or default_symbol)
-        else:
-            print("Open perpetual positions detected:")
-            for i, p in enumerate(detected, 1):
-                try:
-                    print(f"  {i}) {p['symbol']} {p['side']} {float(p['size_usdt']):.2f}USDT @ {float(p['entry_price']):.6f} x{int(p['leverage'])}")
-                except Exception:
-                    print(f"  {i}) {p}")
-            sel = input("Select a position number to manage (or press Enter to skip): ").strip()
-            if sel.isdigit():
-                k = int(sel)
-                if 1 <= k <= len(detected):
-                    chosen_symbol = str(detected[k-1].get("symbol") or default_symbol)
-
-    prompt_symbol = chosen_symbol or (detected[0]["symbol"] if detected else default_symbol)
-
-    # 1) Takeover prompt exactly as requested
-    takeover = _ask_yes_no(
-        f"Open perpetual positions detected ({prompt_symbol}). Take over management now using existing size and leverage?",
-        default_yes=None
-    )
+    if not open_positions:
+        takeover = False
+    elif len(open_positions) == 1:
+        only = open_positions[0]
+        detected_sym = _normalize_symbol(str(only.get("symbol", default_symbol)))
+        ans = _ask_yes_no(
+            f"Open perpetual position detected ({detected_sym}). Take over management now using existing size and leverage?",
+            default_yes=None
+        )
+        takeover = bool(ans)
+        chosen_symbol = detected_sym if takeover else None
+    else:
+        print("Open perpetual positions detected:")
+        for i, p in enumerate(open_positions, 1):
+            try:
+                ep = float(p.get("entry_price", 0.0))
+                sz = float(p.get("size_usdt", 0.0))
+                lev = int(p.get("leverage", int(default_lev)))
+            except Exception:
+                ep, sz, lev = 0.0, 0.0, int(default_lev)
+            print(f"  {i}) {p.get('symbol')} {p.get('side')} ~{sz:.2f}USDT @ {ep:.6f} x{lev}")
+        sel = input("Take over which position? Enter number or press Enter to skip: ").strip()
+        if sel.isdigit():
+            idx = int(sel) - 1
+            if 0 <= idx < len(open_positions):
+                chosen_symbol = _normalize_symbol(str(open_positions[idx].get("symbol", default_symbol)))
+        takeover = bool(chosen_symbol)
 
     if takeover:
+        # Skip ALL further prompts; use env/defaults and the detected symbol
         symbol_in = chosen_symbol or default_symbol
         live_in = default_live_env
         stake_in = default_stake
