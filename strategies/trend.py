@@ -25,7 +25,22 @@ class TrendStrategy:
         self.atr_len = atr_len
         self.min_trail = float(min_trail)
         self.max_trail = float(max_trail)
+        self._lev = 1
         self._prices: Deque[float] = collections.deque(maxlen=max(slow, atr_len) + 2)
+
+    def set_leverage(self, lev: int) -> None:
+        self._lev = max(1, int(lev))
+
+    def set_windows(self, fast: int, slow: int) -> None:
+        if fast >= slow:
+            return
+        self.fast = int(fast)
+        self.slow = int(slow)
+        self._prices = collections.deque(self._prices, maxlen=max(self.slow, self.atr_len) + 2)
+
+    def set_atr_len(self, n: int) -> None:
+        self.atr_len = max(5, int(n))
+        self._prices = collections.deque(self._prices, maxlen=max(self.slow, self.atr_len) + 2)
 
     def update_tick(self, price: float) -> None:
         if not math.isfinite(price) or price <= 0:
@@ -59,8 +74,10 @@ class TrendStrategy:
             return {"side": "wait", "reason": "warming_up", "trail_pct": self.min_trail, "caution": None}
 
         atrp = self._atr_pct() or 0.0
-        # Base trail uses 2× ATR proxy, clamped into [min_trail, max_trail]
-        trail = max(self.min_trail, min(self.max_trail, 2.0 * atrp))
+        # Base trail uses 2× ATR proxy, clamped, then tighten by leverage factor
+        base_trail = max(self.min_trail, min(self.max_trail, 2.0 * atrp))
+        lev_tight = base_trail / (self._lev ** 0.5)
+        trail = max(self.min_trail, min(self.max_trail, lev_tight))
 
         side = "wait"
         reason = "flat"
