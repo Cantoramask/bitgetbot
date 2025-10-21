@@ -258,12 +258,10 @@ async def _async_main():
             live=default_live_env,
         )
         await tmp_adapter.connect()
-        # requires API keys; returns [] if none
-        if hasattr(tmp_adapter, "get_all_open_positions"):
+        try:
             open_positions = await tmp_adapter.get_all_open_positions()
-        else:
-            # backwards fallback: check just default_symbol
-            raw = await tmp_adapter.get_open_position()
+        except Exception:
+            raw = await tmp_adapter.get_open_position(default_symbol)
             open_positions = [raw] if raw else []
     except Exception:
         open_positions = []
@@ -305,7 +303,6 @@ async def _async_main():
         margin_in = default_margin
         vol_in = default_vol
     else:
-        # 2) Symbol format examples block (pure print, no input yet)
         examples = textwrap.dedent(
             """\
             Symbol format examples:
@@ -315,23 +312,11 @@ async def _async_main():
               BTC            converts to BTC/USDT:USDT"""
         )
         print(examples)
-
-        # 3) Symbol [BTC/USDT:USDT]:
         symbol_in = _ask("Symbol", default_symbol)
-
-        # 4) Live trading? (Y/N) [N]:
         live_in = _ask_yes_no("Live trading?", default_yes=False if not default_live_env else True)
-
-        # 5) USDT margin per trade [50.0]:
         stake_in = _ask("USDT margin per trade", default_stake)
-
-        # 6) Leverage x [5]:
         lev_in = _ask("Leverage x", default_lev)
-
-        # 7) Margin mode cross or isolated [cross]:
         margin_in = _ask("Margin mode cross or isolated", default_margin)
-
-        # 8) Volatility profile [High/Medium/Low] (default Medium):
         vol_in = input("Volatility profile [High/Medium/Low] (default Medium): ").strip() or default_vol
 
     # Build config
