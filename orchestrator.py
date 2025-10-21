@@ -22,7 +22,6 @@ from journal_logger import JournalLogger
 from risk_manager import RiskManager, RiskLimits
 from exchange.adapter import BitgetAdapter
 from ai.reasoner import Reasoner
-from exchange.adapter import BitgetAdapter
 from data.feeder import DataFeeder
 from strategies.trend import TrendStrategy
 
@@ -74,15 +73,20 @@ class Orchestrator:
             live=self.cfg.live,
         )
 
-        self.feeder = DataFeeder(self.adapter, window=1200, poll_sec=1.0)
-        self.strategy = TrendStrategy(fast=20, slow=50, atr_len=self._params.atr_len,
-                                      min_trail=self._params.min_trail_init,
-                                      max_trail=self._params.max_trail_init)
-
         self._stop = asyncio.Event()
         self._last_action_ts = 0.0
         self._position: Optional[Position] = None
+
         self._params = self._make_params_from_vol_profile(self.cfg.vol_profile)
+
+        self.feeder = DataFeeder(self.adapter, window=1200, poll_sec=1.0)
+        self.strategy = TrendStrategy(
+            fast=20,
+            slow=50,
+            atr_len=self._params.atr_len,
+            min_trail=self._params.min_trail_init,
+            max_trail=self._params.max_trail_init
+        )
 
         self._wins = 0
         self._losses = 0
@@ -129,6 +133,8 @@ class Orchestrator:
                 t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(*tasks)
+            with contextlib.suppress(Exception):
+                await self.feeder.stop()
             self._save_state()
             self.jlog.shutdown()
 
