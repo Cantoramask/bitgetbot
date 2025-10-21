@@ -39,6 +39,9 @@ class RiskLimits:
     reopen_cooldown_sec: int = 60          # after any exit
     loss_cooldown_sec: int = 300           # after a loss
     flip_cooldown_sec: int = 120           # after switching side long<->short
+    # New leverage aware limits
+    max_notional_usdt: float = 2_000.0     # cap stake * leverage
+    loss_cd_scale_base_lev: int = 5        # scale loss cooldown around this lev
 
     # Optional stake trims based on volatility profile (High/Medium/Low).
     # The orchestrator can pass its vol_profile so we scale stakes gently.
@@ -73,8 +76,10 @@ class RiskManager:
         # Examples:
         #   RISK_MAX_LEVERAGE_DEFAULT=30
         #   RISK_MAX_STAKE_DEFAULT=200
+        #   RISK_MAX_NOTIONAL_DEFAULT=5000
         #   RISK_MAX_LEVERAGE_SOL=100
         #   RISK_MAX_STAKE_SOL=500
+        #   RISK_MAX_NOTIONAL_SOL=15000
         self._overrides = self._load_overrides()
 
         # Reduce console spam when orders are repeatedly blocked during cooldowns.
@@ -148,37 +153,45 @@ class RiskManager:
         # Defaults
         default_max_lev = _getf("RISK_MAX_LEVERAGE_DEFAULT")
         default_max_stake = _getf("RISK_MAX_STAKE_DEFAULT")
-        if default_max_lev or default_max_stake:
+        default_max_notional = _getf("RISK_MAX_NOTIONAL_DEFAULT")
+        if default_max_lev or default_max_stake or default_max_notional:
             ov["__DEFAULT__"] = {}
             if default_max_lev:
                 ov["__DEFAULT__"]["max_leverage"] = int(default_max_lev)
             if default_max_stake:
                 ov["__DEFAULT__"]["max_stake_usdt"] = float(default_max_stake)
+            if default_max_notional:
+                ov["__DEFAULT__"]["max_notional_usdt"] = float(default_max_notional)
 
-        # Per-coin like RISK_MAX_LEVERAGE_SOL, RISK_MAX_STAKE_SOL
+        # Per-coin like RISK_MAX_LEVERAGE_SOL, RISK_MAX_STAKE_SOL, RISK_MAX_NOTIONAL_SOL
         for k, v in os.environ.items():
-            if not k.startswith("RISK_MAX_LEVERAGE_") and not k.startswith("RISK_MAX_STAKE_"):
+            if not (k.startswith("RISK_MAX_LEVERAGE_") or k.startswith("RISK_MAX_STAKE_") or k.startswith("RISK_MAX_NOTIONAL_")):
                 continue
             parts = k.split("_")
             if len(parts) < 3:
                 continue
-            kind = "_".join(parts[:2])  # RISK_MAX_LEVERAGE or RISK_MAX_STAKE
+            kind = "_".join(parts[:3]) if parts[2] == "MAX" else "_".join(parts[:2])
+            # normalise coin tail
             coin = "_".join(parts[3:]) if parts[2] == "DEFAULT" else "_".join(parts[2:])
             coin = coin.strip().upper()
             if not coin:
                 continue
             ov.setdefault(coin, {})
-            if kind == "RISK_MAX_LEVERAGE":
+            if k.startswith("RISK_MAX_LEVERAGE_"):
                 try:
                     ov[coin]["max_leverage"] = int(float(v))
                 except Exception:
                     pass
-            elif kind == "RISK_MAX_STAKE":
+            elif k.startswith("RISK_MAX_STAKE_"):
                 try:
                     ov[coin]["max_stake_usdt"] = float(v)
                 except Exception:
                     pass
-
+            elif k.startswith("RISK_MAX_NOTIONAL_"):
+                try:
+                    ov[coin]["max_notional_usdt"] = float(v)
+                except Exception:
+                    pass
         return ov
 
     def _apply_overrides(self, symbol: str, base: RiskLimits) -> RiskLimits:
@@ -191,13 +204,31 @@ class RiskManager:
             limits.max_leverage = int(dflt["max_leverage"])
         if "max_stake_usdt" in dflt:
             limits.max_stake_usdt = float(dflt["max_stake_usdt"])
+        if "max_notional_usdt" in dflt:
+            limits.max_notional_usdt = float(dflt["max_notional_usdt"])
         # Per-coin overrides next
         ov = self._overrides.get(key, {})
         if "max_leverage" in ov:
             limits.max_leverage = int(ov["max_leverage"])
         if "max_stake_usdt" in ov:
             limits.max_stake_usdt = float(ov["max_stake_usdt"])
+        if "max_notional_usdt" in ov:
+            limits.max_notional_usdt = float(ov["max_notional_usdt"])
         return limits
+
+    # ---- leverage aware helpers ----
+    def _lev_stake_scale(self, lev: int) -> float:
+        # halve stake at lev=4 to 5 and continue to decrease sublinearly
+        l = max(1, int(lev))
+        return 1.0 / (l ** 0.5)
+
+    def _scaled_loss_cd(self, base_cd: int, lev: int, base_lev: int) -> int:
+        if base_cd <= 0:
+            return 0
+        l = max(1, int(lev))
+        b = max(1, int(base_lev))
+        factor = max(1.0, (l / b) ** 0.5)
+        return int(round(base_cd * factor))
 
     # ---- public API for orchestrator ----
     def check_order(
@@ -233,42 +264,51 @@ class RiskManager:
             reasons.append(f"leverage {lev} exceeds max {limits.max_leverage}")
             lev = limits.max_leverage
 
-        # 2) Volatility-based stake scale
+        # 2) Volatility-based stake scale and leverage-based scale
         v = (vol_profile or "Medium").lower()
-        scale = 1.0
+        scale_vol = 1.0
         if v == "high":
-            scale = limits.vol_stake_scale_high
+            scale_vol = limits.vol_stake_scale_high
         elif v == "low":
-            scale = limits.vol_stake_scale_low
+            scale_vol = limits.vol_stake_scale_low
         else:
-            scale = limits.vol_stake_scale_medium
+            scale_vol = limits.vol_stake_scale_medium
 
-        stake = float(requested_stake_usdt) * float(scale)
+        scale_lev = self._lev_stake_scale(lev)
+        stake = float(requested_stake_usdt) * float(scale_vol) * float(scale_lev)
 
         # 3) Max stake fence
         if stake > limits.max_stake_usdt:
             reasons.append(f"stake {stake:.2f} > max_stake {limits.max_stake_usdt:.2f}, trimming")
             stake = float(limits.max_stake_usdt)
 
-        # 4) Daily loss check
+        # 4) Notional fence
+        notional = stake * lev
+        if notional > limits.max_notional_usdt:
+            reasons.append(f"notional {notional:.2f} > max_notional {limits.max_notional_usdt:.2f}, trimming")
+            stake = limits.max_notional_usdt / max(1, lev)
+            notional = stake * lev
+
+        # 5) Daily loss check
         daily_loss = -min(0.0, self.state.realized_pnl_usdt)  # positive number if losing
         remaining_loss_budget = max(0.0, limits.max_daily_loss_usdt - daily_loss)
         if remaining_loss_budget <= 0.0:
             reasons.append("max daily loss reached")
             allowed = False
 
-        # 5) Cooldowns: after any exit and after a loss
+        # 6) Cooldowns: after any exit and after a loss with leverage aware scaling
         remain_exit = self._remaining(self.state.last_exit_ts, limits.reopen_cooldown_sec, now)
         if remain_exit > 0:
             reasons.append(f"reopen cooldown {remain_exit}s")
             allowed = False
 
-        remain_loss = self._remaining(self.state.last_loss_ts, limits.loss_cooldown_sec, now)
+        eff_loss_cd = self._scaled_loss_cd(limits.loss_cooldown_sec, lev, limits.loss_cd_scale_base_lev)
+        remain_loss = self._remaining(self.state.last_loss_ts, eff_loss_cd, now)
         if remain_loss > 0:
             reasons.append(f"loss cooldown {remain_loss}s")
             allowed = False
 
-        # 6) Flip cooldown
+        # 7) Flip cooldown
         # If the caller did not specify is_flip, infer it from last_side.
         if is_flip is None:
             is_flip = self.state.last_side and self.state.last_side != side
@@ -284,11 +324,13 @@ class RiskManager:
             "stake_usdt": round(stake, 8),
             "requested_stake_usdt": float(requested_stake_usdt),
             "requested_leverage": int(requested_leverage),
-            "scaled_by_vol": scale,
+            "scaled_by_vol": scale_vol,
+            "scaled_by_leverage": scale_lev,
+            "effective_notional_usdt": round(notional, 8),
             "reasons": reasons,
             "cooldowns": {
                 "reopen_sec": max(0, limits.reopen_cooldown_sec - int(now - self.state.last_exit_ts)),
-                "loss_sec": max(0, limits.loss_cooldown_sec - int(now - self.state.last_loss_ts)),
+                "loss_sec": max(0, eff_loss_cd - int(now - self.state.last_loss_ts)),
                 "flip_sec": max(0, limits.flip_cooldown_sec - int(now - self.state.last_flip_ts)) if is_flip else 0,
             },
             "daily_loss_so_far": round(daily_loss, 8),
@@ -298,6 +340,7 @@ class RiskManager:
             "applied_limits": {
                 "max_leverage": limits.max_leverage,
                 "max_stake_usdt": limits.max_stake_usdt,
+                "max_notional_usdt": limits.max_notional_usdt,
                 "max_daily_loss_usdt": limits.max_daily_loss_usdt,
             },
         }
@@ -356,7 +399,6 @@ class RiskManager:
             return 0
         remain = window_sec - int(now - start_ts)
         return max(0, remain)
-
 
 # ---------------
 # Minimal self-test
