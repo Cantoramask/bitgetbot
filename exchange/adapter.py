@@ -104,33 +104,34 @@ class BitgetAdapter:
             raise RuntimeError("Bad price from ticker")
         return {"symbol": self.symbol, "price": px, "ts": t.get("timestamp", int(time.time() * 1000))}
 
-    async def get_open_position(self) -> Optional[Dict[str, Any]]:
-        def _pos():
-            return self.ex.fetch_positions([self.symbol])
+    async def get_all_open_positions(self) -> list[Dict[str, Any]]:
+        """Return all open swap-linear positions as a normalised list."""
+        def _pos_all():
+            return self.ex.fetch_positions()
         try:
-            rows = await asyncio.to_thread(_pos)
+            rows = await asyncio.to_thread(_pos_all)
         except Exception as e:
-            self.log.info(f"[EX] fetch_positions error: {e}")
-            return None
+            self.log.info(f"[EX] fetch_positions(all) error: {e}")
+            return []
+        out = []
         for r in rows or []:
-            if r.get("symbol") != self.symbol:
-                continue
             amt = float(r.get("contracts", r.get("amount", 0)) or 0)
             if abs(amt) < 1e-12:
                 continue
-            side = "long" if amt > 0 else "short"
+            sym = r.get("symbol") or ""
             entry = float(r.get("entryPrice") or r.get("entry_price") or 0.0)
             lev = int(r.get("leverage") or self.leverage)
-            size_usdt = abs(amt) * entry
-            return {
-                "symbol": self.symbol,
+            side = "long" if amt > 0 else "short"
+            size_usdt = abs(amt) * entry if entry > 0 else abs(amt)
+            out.append({
+                "symbol": sym,
                 "side": side,
                 "size_usdt": float(size_usdt),
                 "entry_price": float(entry),
                 "leverage": lev,
                 "contracts": abs(amt),
-            }
-        return None
+            })
+        return out
 
     def _amount_from_usdt(self, usdt: float, price: float) -> float:
         # interpret usdt as margin; notional = margin * leverage
