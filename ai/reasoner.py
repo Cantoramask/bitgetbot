@@ -42,10 +42,19 @@ class Reasoner:
         if not self.enabled or not self.client:
             return True, 1.0, "disabled"
 
+        # snapshot expected keys
+        # price, trail_init, trail_tight, intel_sec, stake, lev, lev_tighten, vol, side
+        # effective_notional, cooldowns
+        policy = (
+            "Block if leverage is high and parameters are not tightened. "
+            "Require shorter intelligence_sec at higher leverage, tighter trails, and reasonable notional."
+        )
         prompt = (
             "You are a cautious trading gate. Reply as JSON with keys allow:boolean, confidence:0..1, note:string. "
-            "Approve entries only when risk seems reasonable.\n"
-            f"Snapshot: {snapshot}"
+            f"Policy: {policy}\n"
+            "Approve entries only when risk seems reasonable given leverage and notional. "
+            "Snapshot follows as JSON:\n"
+            f"{snapshot}"
         )
         try:
             resp = self.client.chat.completions.create(
