@@ -233,13 +233,16 @@ class Orchestrator:
                         await asyncio.sleep(1.0)
                         continue
 
+                    # Use the *effective* leverage (after any risk trims) for advisor + logs
+                    lev_to_use = int(info.get("leverage", self.cfg.leverage))
+
                     snapshot = {
                         "price": self._last_price,
                         "trail_init": self._params.trail_pct_init,
                         "trail_tight": self._params.trail_pct_tight,
                         "intel_sec": self._params.intelligence_sec,
                         "stake": stake,
-                        "lev": self.cfg.leverage,
+                        "lev": lev_to_use,
                         "vol": self.cfg.vol_profile,
                         "side": side_choice,
                         "strategy": decision,
@@ -251,7 +254,6 @@ class Orchestrator:
                         continue
                     self.jlog.advisor(True, conf, note)
 
-                    lev_to_use = int(info.get("leverage", self.cfg.leverage))
                     if lev_to_use != self.adapter.leverage:
                         self.adapter.leverage = lev_to_use
                         try:
