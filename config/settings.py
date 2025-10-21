@@ -32,7 +32,7 @@ class Settings:
     stake_usdt: float = _float("BASE_USDT_PER_TRADE", 50.0)
     leverage: int = _int("LEVERAGE", 5)
     margin_mode: str = os.getenv("MARGIN_MODE", "cross")
-    vol_profile: str = os.getenv("VOL_PROFILE", "Medium")
+    vol_profile: str = os.getenv("VOL_PROFILE", "auto")
     live: bool = _bool("LIVE", False)
     advisor_enabled: bool = _bool("ADVISOR_ENABLED", False)
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
