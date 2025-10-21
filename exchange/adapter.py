@@ -70,14 +70,30 @@ class BitgetAdapter:
             self.symbol = sym
         self._market = self._markets[self.symbol]
         if self.live:
-            try:
-                await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
-            except Exception as e:
-                self.log.info(f"[EX] set_leverage warn: {e}")
+            # try set margin mode first (harmless if already correct)
             try:
                 await asyncio.to_thread(self.ex.set_margin_mode, self.margin_mode, self.symbol)
             except Exception as e:
                 self.log.info(f"[EX] set_margin_mode warn: {e}")
+
+            # set leverage; if Bitget rejects, step down to the highest allowed
+            try:
+                await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
+            except Exception as e:
+                # probe max allowed: try descending until it sticks
+                max_lev = int(self._market.get("limits", {}).get("leverage", {}).get("max") or self.leverage)
+                probed = False
+                for lev in range(min(self.leverage, max_lev), 0, -1):
+                    try:
+                        await asyncio.to_thread(self.ex.set_leverage, lev, self.symbol)
+                        self.leverage = lev
+                        probed = True
+                        self.log.info(f"[EX] leverage set to {lev} after adjust")
+                        break
+                    except Exception:
+                        continue
+                if not probed:
+                    self.log.info(f"[EX] set_leverage failed for all attempts: {e}")
 
     async def fetch_ticker(self) -> Dict[str, Any]:
         def _fetch():
@@ -117,12 +133,12 @@ class BitgetAdapter:
         return None
 
     def _amount_from_usdt(self, usdt: float, price: float) -> float:
-        amount = float(usdt) / max(1.0, float(price))
+        # interpret usdt as margin; notional = margin * leverage
+        notional = float(usdt) * max(1, int(self.leverage))
+        amount = notional / max(1.0, float(price))
         try:
-            # Use ccxt’s precision logic for this market/symbol
             amount = float(self.ex.amount_to_precision(self.symbol, amount))
         except Exception:
-            # Fallback: treat precision.amount as a step size (e.g. 0.0001)
             prec = self._market["precision"].get("amount", None)
             if isinstance(prec, (int, float)) and prec > 0:
                 step = float(prec)
