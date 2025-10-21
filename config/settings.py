@@ -39,3 +39,5 @@ class Settings:
     intelligence_check_sec: int = _int("INTELLIGENCE_CHECK_SEC", 10)
     logs_dir: str = os.getenv("LOGS_DIR", "logs")
     data_dir: str = os.getenv("DATA_DIR", "data")
+    # optional risk caps
+    max_notional_usdt: float = _float("RISK_MAX_NOTIONAL_DEFAULT", 2000.0)
