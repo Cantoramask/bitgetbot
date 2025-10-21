@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from typing import Optional, Dict, Any, Tuple
 
 
@@ -69,6 +69,19 @@ class RiskManager:
         os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
         self.state = self._load_state()
 
+        # Per-symbol overrides loaded from environment once at startup.
+        # Examples:
+        #   RISK_MAX_LEVERAGE_DEFAULT=30
+        #   RISK_MAX_STAKE_DEFAULT=200
+        #   RISK_MAX_LEVERAGE_SOL=100
+        #   RISK_MAX_STAKE_SOL=500
+        self._overrides = self._load_overrides()
+
+        # Reduce console spam when orders are repeatedly blocked during cooldowns.
+        self._last_block_sig: Optional[str] = None
+        self._last_block_log_ts: float = 0.0
+        self._block_log_every_sec: int = int(os.getenv("RISK_BLOCK_LOG_EVERY_SEC", "5"))  # log at most every 5s
+
     # ---- persistence ----
     def _load_state(self) -> RiskState:
         try:
@@ -107,6 +120,85 @@ class RiskManager:
         except Exception:
             pass
 
+    def _norm_symbol_key(self, symbol: str) -> str:
+        """Normalise symbols to a simple key like 'SOL' or 'SOLUSDT'.
+        Accepts 'SOL/USDT:USDT', 'SOL/USDT', 'SOLUSDT', 'SOL'."""
+        s = (symbol or "").upper().strip()
+        s = s.replace(":USDT", "")
+        s = s.replace("/", "")
+        # If it ends with USDT or USD, keep base only for overrides keyed by coin.
+        if s.endswith("USDT") and len(s) > 4:
+            return s[:-4]  # SOL
+        if s.endswith("USD") and len(s) > 3:
+            return s[:-3]
+        return s  # e.g. SOL
+
+    def _load_overrides(self) -> Dict[str, Dict[str, float]]:
+        """Load per-symbol and default overrides from environment variables."""
+        ov: Dict[str, Dict[str, float]] = {}
+        def _getf(name: str) -> Optional[float]:
+            v = os.getenv(name)
+            if v is None or v == "":
+                return None
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        # Defaults
+        default_max_lev = _getf("RISK_MAX_LEVERAGE_DEFAULT")
+        default_max_stake = _getf("RISK_MAX_STAKE_DEFAULT")
+        if default_max_lev or default_max_stake:
+            ov["__DEFAULT__"] = {}
+            if default_max_lev:
+                ov["__DEFAULT__"]["max_leverage"] = int(default_max_lev)
+            if default_max_stake:
+                ov["__DEFAULT__"]["max_stake_usdt"] = float(default_max_stake)
+
+        # Per-coin like RISK_MAX_LEVERAGE_SOL, RISK_MAX_STAKE_SOL
+        for k, v in os.environ.items():
+            if not k.startswith("RISK_MAX_LEVERAGE_") and not k.startswith("RISK_MAX_STAKE_"):
+                continue
+            parts = k.split("_")
+            if len(parts) < 3:
+                continue
+            kind = "_".join(parts[:2])  # RISK_MAX_LEVERAGE or RISK_MAX_STAKE
+            coin = "_".join(parts[3:]) if parts[2] == "DEFAULT" else "_".join(parts[2:])
+            coin = coin.strip().upper()
+            if not coin:
+                continue
+            ov.setdefault(coin, {})
+            if kind == "RISK_MAX_LEVERAGE":
+                try:
+                    ov[coin]["max_leverage"] = int(float(v))
+                except Exception:
+                    pass
+            elif kind == "RISK_MAX_STAKE":
+                try:
+                    ov[coin]["max_stake_usdt"] = float(v)
+                except Exception:
+                    pass
+
+        return ov
+
+    def _apply_overrides(self, symbol: str, base: RiskLimits) -> RiskLimits:
+        """Return a new RiskLimits with per-symbol or default overrides applied."""
+        key = self._norm_symbol_key(symbol)
+        limits = replace(base)
+        # Default overrides first
+        dflt = self._overrides.get("__DEFAULT__", {})
+        if "max_leverage" in dflt:
+            limits.max_leverage = int(dflt["max_leverage"])
+        if "max_stake_usdt" in dflt:
+            limits.max_stake_usdt = float(dflt["max_stake_usdt"])
+        # Per-coin overrides next
+        ov = self._overrides.get(key, {})
+        if "max_leverage" in ov:
+            limits.max_leverage = int(ov["max_leverage"])
+        if "max_stake_usdt" in ov:
+            limits.max_stake_usdt = float(ov["max_stake_usdt"])
+        return limits
+
     # ---- public API for orchestrator ----
     def check_order(
         self,
@@ -119,8 +211,7 @@ class RiskManager:
         now_ts: Optional[float] = None,
         is_flip: Optional[bool] = None # if orchestrator knows it's flipping
     ) -> Tuple[bool, float, Dict[str, Any]]:
-        """
-        Decide if a new order is allowed, and what stake to use.
+        """Decide if a new order is allowed, and what stake to use.
 
         Returns a tuple:
             (allowed: bool, stake_usdt: float, info: dict)
@@ -133,43 +224,46 @@ class RiskManager:
         reasons = []
         allowed = True
 
+        # Apply per-symbol overrides to the base limits.
+        limits = self._apply_overrides(symbol, self.limits)
+
         # 1) Leverage fence
         lev = int(requested_leverage)
-        if lev > self.limits.max_leverage:
-            reasons.append(f"leverage {lev} exceeds max {self.limits.max_leverage}")
-            lev = self.limits.max_leverage
+        if lev > limits.max_leverage:
+            reasons.append(f"leverage {lev} exceeds max {limits.max_leverage}")
+            lev = limits.max_leverage
 
         # 2) Volatility-based stake scale
         v = (vol_profile or "Medium").lower()
         scale = 1.0
         if v == "high":
-            scale = self.limits.vol_stake_scale_high
+            scale = limits.vol_stake_scale_high
         elif v == "low":
-            scale = self.limits.vol_stake_scale_low
+            scale = limits.vol_stake_scale_low
         else:
-            scale = self.limits.vol_stake_scale_medium
+            scale = limits.vol_stake_scale_medium
 
         stake = float(requested_stake_usdt) * float(scale)
 
         # 3) Max stake fence
-        if stake > self.limits.max_stake_usdt:
-            reasons.append(f"stake {stake:.2f} > max_stake {self.limits.max_stake_usdt:.2f}, trimming")
-            stake = float(self.limits.max_stake_usdt)
+        if stake > limits.max_stake_usdt:
+            reasons.append(f"stake {stake:.2f} > max_stake {limits.max_stake_usdt:.2f}, trimming")
+            stake = float(limits.max_stake_usdt)
 
         # 4) Daily loss check
         daily_loss = -min(0.0, self.state.realized_pnl_usdt)  # positive number if losing
-        remaining_loss_budget = max(0.0, self.limits.max_daily_loss_usdt - daily_loss)
+        remaining_loss_budget = max(0.0, limits.max_daily_loss_usdt - daily_loss)
         if remaining_loss_budget <= 0.0:
             reasons.append("max daily loss reached")
             allowed = False
 
         # 5) Cooldowns: after any exit and after a loss
-        remain_exit = self._remaining(self.state.last_exit_ts, self.limits.reopen_cooldown_sec, now)
+        remain_exit = self._remaining(self.state.last_exit_ts, limits.reopen_cooldown_sec, now)
         if remain_exit > 0:
             reasons.append(f"reopen cooldown {remain_exit}s")
             allowed = False
 
-        remain_loss = self._remaining(self.state.last_loss_ts, self.limits.loss_cooldown_sec, now)
+        remain_loss = self._remaining(self.state.last_loss_ts, limits.loss_cooldown_sec, now)
         if remain_loss > 0:
             reasons.append(f"loss cooldown {remain_loss}s")
             allowed = False
@@ -178,7 +272,7 @@ class RiskManager:
         # If the caller did not specify is_flip, infer it from last_side.
         if is_flip is None:
             is_flip = self.state.last_side and self.state.last_side != side
-        remain_flip = self._remaining(self.state.last_flip_ts, self.limits.flip_cooldown_sec, now) if is_flip else 0
+        remain_flip = self._remaining(self.state.last_flip_ts, limits.flip_cooldown_sec, now) if is_flip else 0
         if is_flip and remain_flip > 0:
             reasons.append(f"flip cooldown {remain_flip}s")
             allowed = False
@@ -193,19 +287,30 @@ class RiskManager:
             "scaled_by_vol": scale,
             "reasons": reasons,
             "cooldowns": {
-                "reopen_sec": max(0, self.limits.reopen_cooldown_sec - int(now - self.state.last_exit_ts)),
-                "loss_sec": max(0, self.limits.loss_cooldown_sec - int(now - self.state.last_loss_ts)),
-                "flip_sec": max(0, self.limits.flip_cooldown_sec - int(now - self.state.last_flip_ts)) if is_flip else 0,
+                "reopen_sec": max(0, limits.reopen_cooldown_sec - int(now - self.state.last_exit_ts)),
+                "loss_sec": max(0, limits.loss_cooldown_sec - int(now - self.state.last_loss_ts)),
+                "flip_sec": max(0, limits.flip_cooldown_sec - int(now - self.state.last_flip_ts)) if is_flip else 0,
             },
             "daily_loss_so_far": round(daily_loss, 8),
             "daily_loss_budget_left": round(remaining_loss_budget, 8),
             "vol_profile": vol_profile,
             "is_flip": bool(is_flip),
+            "applied_limits": {
+                "max_leverage": limits.max_leverage,
+                "max_stake_usdt": limits.max_stake_usdt,
+                "max_daily_loss_usdt": limits.max_daily_loss_usdt,
+            },
         }
 
         # Final allow/deny
         if not allowed:
-            self._safe_log(f"[RISK] BLOCK {side} {stake:.2f}USDT lev={lev} | {'; '.join(reasons)}")
+            # Build a signature of the block reasons to avoid spamming logs.
+            sig = f"{side}|{lev}|{round(stake,2)}|{'|'.join(reasons)}"
+            now_ts = time.time()
+            if sig != self._last_block_sig or (now_ts - self._last_block_log_ts) >= self._block_log_every_sec:
+                self._safe_log(f"[RISK] BLOCK {side} {stake:.2f}USDT lev={lev} | {'; '.join(reasons)}")
+                self._last_block_sig = sig
+                self._last_block_log_ts = now_ts
             return False, 0.0, info
 
         # Allow with any trims already applied
@@ -261,21 +366,26 @@ if __name__ == "__main__":
         def info(self, *a, **k):
             print(*a)
 
-    rm = RiskManager(_DummyLog(), RiskLimits(max_leverage=10, max_stake_usdt=75, max_daily_loss_usdt=50))
+    # Example: allow bigger leverage and stake by default and specifically for SOL.
+    os.environ.setdefault("RISK_MAX_LEVERAGE_DEFAULT", "30")
+    os.environ.setdefault("RISK_MAX_STAKE_DEFAULT", "200")
+    os.environ.setdefault("RISK_MAX_LEVERAGE_SOL", "100")
+    os.environ.setdefault("RISK_MAX_STAKE_SOL", "500")
+
+    rm = RiskManager(_DummyLog(), RiskLimits(max_leverage=20, max_stake_usdt=100, max_daily_loss_usdt=300))
     ok, stake, info = rm.check_order(
-        symbol="BTC/USDT:USDT",
+        symbol="SOL/USDT:USDT",
         side="long",
-        requested_stake_usdt=100.0,
-        requested_leverage=25,
-        vol_profile="High"
+        requested_stake_usdt=120.0,
+        requested_leverage=30,
+        vol_profile="Medium"
     )
-    print("allowed:", ok, "stake:", stake, "info:", info)
+    print("allowed:", ok, "stake:", stake, "info:", {k: info[k] for k in ('leverage','stake_usdt','reasons','applied_limits')})
     if ok:
-        # Pretend we took a loss and then check cooldowns kick in.
         rm.register_fill(pnl_usdt=-12.34)
         rm.note_exit()
         ok2, stake2, info2 = rm.check_order(
-            symbol="BTC/USDT:USDT",
+            symbol="SOL/USDT:USDT",
             side="short",
             requested_stake_usdt=50.0,
             requested_leverage=5,
