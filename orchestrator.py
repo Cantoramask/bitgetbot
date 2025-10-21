@@ -254,6 +254,7 @@ class Orchestrator:
                         continue
                     self.jlog.advisor(True, conf, note)
 
+                    # Make sure adapter is set to the leverage we will actually use.
                     if lev_to_use != self.adapter.leverage:
                         self.adapter.leverage = lev_to_use
                         try:
@@ -267,17 +268,28 @@ class Orchestrator:
                         self.jlog.warn("open_failed")
                         await asyncio.sleep(1.0)
                         continue
+
+                    # Ensure the Position we store/log shows the leverage we actually used.
                     raw.pop("order", None)
+                    raw["leverage"] = lev_to_use
+
+                    # In live mode, re-read the exchange position to capture its final leverage/avg price.
+                    if self.adapter.live:
+                        try:
+                            fresh = await self.adapter.get_open_position()
+                            if fresh and fresh.get("symbol") == self.cfg.symbol:
+                                fresh.pop("order", None)
+                                fresh["leverage"] = int(fresh.get("leverage", lev_to_use) or lev_to_use)
+                                raw = fresh
+                        except Exception as e:
+                            self.jlog.warn("refresh_position_warn", error=str(e))
+
                     self._position = Position(**raw)  # type: ignore[arg-type]
                     self._last_action_ts = now
                     self.risk.set_last_side(side_choice)
                     self.jlog.trade_open(self.cfg.symbol, side_choice, stake, self._position.entry_price, self._position.leverage)
                     self._save_state()
                     continue
-                if self._position is not None:
-                    if self._last_price is None:
-                        await asyncio.sleep(0.5)
-                        continue
 
                     pos = self._position
                     direction = 1 if pos.side == "long" else -1
