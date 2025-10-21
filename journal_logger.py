@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import time
+import os
 from typing import Any, Dict, Optional
 
 try:
@@ -56,6 +57,8 @@ class JournalLogger:
             raise TypeError("logger must be a logging.Logger")
         self.log = logger
         self.jsonl = jsonl or JsonlJournal("events")
+        # Minimal mode hides noisy advisory/tuning chatter
+        self.minimal = os.getenv("LOG_MINIMAL", "false").lower() in ("1", "true", "y", "yes")
 
     # ------------
     # Low-level
@@ -93,10 +96,14 @@ class JournalLogger:
         self._write("info", msg, "heartbeat", fields)
 
     def decision(self, side: str, reason: str, trail_pct: float, cautions: Optional[str] = None) -> None:
+        if self.minimal:
+            return
         msg = f"[DECIDE] side={side} trail={trail_pct:.4%} why={reason}" + (f" note={cautions}" if cautions else "")
         self._write("info", msg, "decision", {"side": side, "trail_pct": trail_pct, "reason": reason, "cautions": cautions})
 
     def knob_change(self, name: str, old: Any, new: Any, why: str) -> None:
+        if self.minimal:
+            return
         msg = f"[KNOB] {name}: {old} -> {new} ({why})"
         self._write("info", msg, "knob_change", {"name": name, "old": old, "new": new, "why": why})
 
@@ -123,8 +130,10 @@ class JournalLogger:
         )
 
     def advisor(self, allow: bool, confidence: float, note: Optional[str] = None) -> None:
-        msg = f"[ADVISOR] allow={allow} conf={confidence:.2f}" + (f" note={note}" if note else "")
-        self._write("info", msg, "advisor", {"allow": allow, "confidence": confidence, "note": note})
+        if self.minimal:
+            return
+        msg = f"[ADVISOR] allow={allow} conf={confidence:.2f}"
+        self._write("info", msg, "advisor", {"allow": allow, "confidence": confidence})
 
     def warn(self, note: str, **fields: Any) -> None:
         msg = f"[WARN] {note}"
@@ -144,7 +153,6 @@ class JournalLogger:
             self.jsonl.rotate_keep_bytes(keep_bytes)
         except Exception:
             pass
-
 
 # ---------------------------
 # Minimal self-test
