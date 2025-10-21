@@ -28,17 +28,13 @@ class TrendStrategy:
         self._lev = 1
         self._prices: Deque[float] = collections.deque(maxlen=max(slow, atr_len) + 2)
 
-    def set_leverage(self, lev: int) -> None:
-        self._lev = max(1, int(lev))
+    def set_windows(self, fast:int, slow:int) -> None:
+        if fast < slow and fast > 0:
+            self.fast = int(fast)
+            self.slow = int(slow)
+            self._prices = collections.deque(self._prices, maxlen=max(self.slow, self.atr_len) + 2)
 
-    def set_windows(self, fast: int, slow: int) -> None:
-        if fast >= slow:
-            return
-        self.fast = int(fast)
-        self.slow = int(slow)
-        self._prices = collections.deque(self._prices, maxlen=max(self.slow, self.atr_len) + 2)
-
-    def set_atr_len(self, n: int) -> None:
+    def set_atr_len(self, n:int) -> None:
         self.atr_len = max(5, int(n))
         self._prices = collections.deque(self._prices, maxlen=max(self.slow, self.atr_len) + 2)
 
