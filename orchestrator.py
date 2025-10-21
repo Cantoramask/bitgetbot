@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # bitgetbot/orchestrator.py
 """
@@ -79,7 +80,6 @@ class Orchestrator:
 
         self._params = self._make_params_from_vol_profile(self.cfg.vol_profile)
 
-        self.feeder = DataFeeder(self.adapter, window=1200, poll_sec=1.0)
         self.strategy = TrendStrategy(
             fast=20,
             slow=50,
@@ -87,6 +87,9 @@ class Orchestrator:
             min_trail=self._params.min_trail_init,
             max_trail=self._params.max_trail_init
         )
+        # tighten initial params to leverage immediately
+        self._apply_leverage_tighten(int(self.cfg.leverage))
+
         self._vol_bucket = (self.cfg.vol_profile or "auto")
         self._last_vol_change_ts = 0.0
 
