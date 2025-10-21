@@ -246,24 +246,46 @@ async def _async_main():
     default_margin = os.getenv("MARGIN_MODE", "cross")
     default_vol = _normalize_vol(os.getenv("VOL_PROFILE", "Medium"))
 
-    # Try to detect a live open position’s symbol for a nicer prompt
-    detected_symbol = None
+    # Try to detect open positions (one or many) for a meaningful prompt/selection
+    detected = []
     try:
         tmp_adapter = BitgetAdapter(
             logger=_setup_logging(),
             symbol=default_symbol,
             leverage=int(default_lev),
             margin_mode=default_margin,
-            live=os.getenv("LIVE", "").lower() in ("1", "true", "y", "yes"),
+            live=default_live_env,
         )
         await tmp_adapter.connect()
-        pos = await tmp_adapter.get_open_position()
-        if pos and pos.get("symbol"):
-            detected_symbol = str(pos["symbol"])
+        # NEW: get all open positions, not just one
+        if hasattr(tmp_adapter, "get_all_open_positions"):
+            detected = await tmp_adapter.get_all_open_positions()
+        else:
+            # Back-compat: fall back to single get_open_position
+            pos = await tmp_adapter.get_open_position()
+            if pos:
+                detected = [pos]
     except Exception:
         pass
 
-    prompt_symbol = detected_symbol or default_symbol
+    chosen_symbol = None
+    if detected:
+        if len(detected) == 1:
+            chosen_symbol = str(detected[0].get("symbol") or default_symbol)
+        else:
+            print("Open perpetual positions detected:")
+            for i, p in enumerate(detected, 1):
+                try:
+                    print(f"  {i}) {p['symbol']} {p['side']} {float(p['size_usdt']):.2f}USDT @ {float(p['entry_price']):.6f} x{int(p['leverage'])}")
+                except Exception:
+                    print(f"  {i}) {p}")
+            sel = input("Select a position number to manage (or press Enter to skip): ").strip()
+            if sel.isdigit():
+                k = int(sel)
+                if 1 <= k <= len(detected):
+                    chosen_symbol = str(detected[k-1].get("symbol") or default_symbol)
+
+    prompt_symbol = chosen_symbol or (detected[0]["symbol"] if detected else default_symbol)
 
     # 1) Takeover prompt exactly as requested
     takeover = _ask_yes_no(
@@ -272,8 +294,7 @@ async def _async_main():
     )
 
     if takeover:
-        # Skip ALL further prompts; use environment/defaults
-        symbol_in = default_symbol
+        symbol_in = chosen_symbol or default_symbol
         live_in = default_live_env
         stake_in = default_stake
         lev_in = default_lev
