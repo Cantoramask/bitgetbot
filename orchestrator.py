@@ -141,6 +141,7 @@ class Orchestrator:
             asyncio.create_task(self._heartbeat(), name="heartbeat"),
             asyncio.create_task(self._regime_cycle(), name="regime_cycle"),
         ]
+        self.logger.info("[DBG] tasks started: %s", [t.get_name() for t in tasks])
 
         try:
             await self._stop.wait()
