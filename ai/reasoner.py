@@ -43,16 +43,17 @@ class Reasoner:
             return True, 1.0, "disabled"
 
         # snapshot expected keys
-        # price, trail_init, trail_tight, intel_sec, stake, lev, lev_tighten, vol, side
-        # effective_notional, cooldowns
+        # price, trail_init, trail_tight, intel_sec, stake, lev, vol, side
+        # effective_notional, cooldowns, atrp
         policy = (
             "Block if leverage is high and parameters are not tightened. "
-            "Require shorter intelligence_sec at higher leverage, tighter trails, and reasonable notional."
+            "Ensure intelligence_sec is shorter at higher leverage, trails are tighter in High, "
+            "and effective notional is within cap. If atrp indicates High but vol is not High, veto."
         )
         prompt = (
             "You are a cautious trading gate. Reply as JSON with keys allow:boolean, confidence:0..1, note:string. "
             f"Policy: {policy}\n"
-            "Approve entries only when risk seems reasonable given leverage and notional. "
+            "Approve entries only when risk seems reasonable given leverage, notional and volatility regime. "
             "Snapshot follows as JSON:\n"
             f"{snapshot}"
         )
