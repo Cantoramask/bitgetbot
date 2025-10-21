@@ -223,6 +223,16 @@ class Orchestrator:
                         continue
                     self.jlog.advisor(True, conf, note)
 
+                    # Apply risk-clamped leverage before opening
+                    lev_to_use = int(info.get("leverage", self.cfg.leverage))
+                    if lev_to_use != self.adapter.leverage:
+                        self.adapter.leverage = lev_to_use
+                        try:
+                            if self.adapter.live:
+                                await asyncio.to_thread(self.adapter.ex.set_leverage, lev_to_use, self.adapter.symbol)
+                        except Exception as e:
+                            self.jlog.warn("set_leverage_warn", error=str(e))
+
                     raw = await self.adapter.place_order(side=side_choice, usdt=stake)
                     if not raw:
                         self.jlog.warn("open_failed")
