@@ -161,8 +161,28 @@ class Orchestrator:
             base = Params(0.008, 0.004, 14, getattr(self.cfg, "intelligence_check_sec", 10), 30, 0.002, 0.025, 0.001, 0.015, 5, 50, 3, 30, 5, 180)
         return base
 
- def _clamp(self, val, lo, hi):
+    def _clamp(self, val, lo, hi):
         return max(lo, min(hi, val))
+
+    def _apply_leverage_tighten(self, lev: int) -> None:
+        l = max(1, int(lev))
+        f = l ** 0.5
+        self._params.trail_pct_init = self._clamp(self._params.trail_pct_init / f, self._params.min_trail_init, self._params.max_trail_init)
+        self._params.trail_pct_tight = self._clamp(self._params.trail_pct_tight / f, self._params.min_trail_tight, self._params.max_trail_tight)
+        self._params.atr_len = self._clamp(int(round(self._params.atr_len / f)), self._params.min_atr_len, self._params.max_atr_len)
+        self._params.intelligence_sec = self._clamp(int(round(self._params.intelligence_sec / f)), self._params.min_intel_sec, self._params.max_intel_sec)
+        self._params.reopen_cooldown_sec = self._clamp(int(round(self._params.reopen_cooldown_sec / (f ** 0.5))), self._params.min_cooldown, self._params.max_cooldown)
+        try:
+            self.feeder.set_poll_sec(max(0.2, 1.0 / f))
+        except Exception:
+            pass
+        try:
+            self.strategy.set_leverage(l)
+            self.strategy.set_windows(max(5, int(20 / f)), max(10, int(50 / f)))
+            self.strategy.set_atr_len(self._params.atr_len)
+        except Exception:
+            pass
+        self.jlog.knob_change("lev_tighten_factor", round(f, 4), round(f, 4), "lev_tighten")
 
     async def _regime_cycle(self):
         try:
@@ -175,34 +195,26 @@ class Orchestrator:
             self.jlog.exception(e, where="regime_cycle")
 
     async def _infer_vol_profile(self, force: bool) -> None:
-        # compute simple ATR percent over recent ticks
-        atrp = self.feeder.atr_pct(180)  # about 3 minutes at 1s polls
+        atrp = self.feeder.atr_pct(180)
         if atrp is None:
             return
         now = time.time()
         old = str(self._vol_bucket)
-        # thresholds with hysteresis
-        # Low < 0.2%, Medium < 0.6%, else High
-        hi = 0.006; lo = 0.002
-        # widen bands to avoid flapping
+        hi = 0.006
+        lo = 0.002
         pad = 0.0005
         if old == "High":
             lo_eff = hi - pad
-            med_eff_lo = lo + pad
         elif old == "Low":
             lo_eff = lo - pad
-            med_eff_lo = lo + pad
         else:
             lo_eff = lo
-            med_eff_lo = lo
-
         if atrp < lo_eff:
             new = "Low"
         elif atrp < hi:
             new = "Medium"
         else:
             new = "High"
-
         dwell_ok = (now - self._last_vol_change_ts) >= 60
         if (new != old and dwell_ok) or force:
             self._last_vol_change_ts = now
@@ -210,12 +222,9 @@ class Orchestrator:
             prev_params = asdict(self._params)
             self.cfg.vol_profile = new
             self._params = self._make_params_from_vol_profile(new)
-            # retighten by leverage and push into strategy and feeder
             self._apply_leverage_tighten(int(self.cfg.leverage))
             try:
-                # adjust strategy windows and atr to new params
                 self.strategy.set_atr_len(self._params.atr_len)
-                # keep roughly proportional to defaults
                 if new == "High":
                     self.strategy.set_windows(12, 30)
                 elif new == "Low":
@@ -224,7 +233,7 @@ class Orchestrator:
                     self.strategy.set_windows(20, 50)
             except Exception:
                 pass
-            self.jlog.knob_change("vol_profile", old, new, f"atrp={round(atrp,6)} prev={prev_params}")
+            self.jlog.knob_change("vol_profile", old, new, f"atrp={round(atrp, 6)} prev={prev_params}")
 
     def _auto_tune_params(self):
         sr = self._success_rate
