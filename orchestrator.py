@@ -22,7 +22,9 @@ from journal_logger import JournalLogger
 from risk_manager import RiskManager, RiskLimits
 from exchange.adapter import BitgetAdapter
 from ai.reasoner import Reasoner
-
+from exchange.adapter import BitgetAdapter
+from data.feeder import DataFeeder
+from strategies.trend import TrendStrategy
 
 @dataclass
 class Position:
@@ -72,6 +74,11 @@ class Orchestrator:
             live=self.cfg.live,
         )
 
+        self.feeder = DataFeeder(self.adapter, window=1200, poll_sec=1.0)
+        self.strategy = TrendStrategy(fast=20, slow=50, atr_len=self._params.atr_len,
+                                      min_trail=self._params.min_trail_init,
+                                      max_trail=self._params.max_trail_init)
+
         self._stop = asyncio.Event()
         self._last_action_ts = 0.0
         self._position: Optional[Position] = None
@@ -105,6 +112,8 @@ class Orchestrator:
                     self.jlog.heartbeat(status="takeover_none")
             except Exception as e:
                 self.jlog.exception(e, where="takeover_check")
+
+        await self.feeder.start()
 
         tasks = [
             asyncio.create_task(self._watch_market(), name="watch_market"),
@@ -163,9 +172,12 @@ class Orchestrator:
     async def _watch_market(self):
         try:
             while not self._stop.is_set():
-                t = await self.adapter.fetch_ticker()
-                self._last_price = float(t["price"])
-                await asyncio.sleep(1)
+                lp = self.feeder.last_price()
+                if lp is not None:
+                    self._last_price = float(lp)
+                    # keep strategy fed from feeder ticks
+                    self.strategy.update_tick(self._last_price)
+                await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -191,7 +203,16 @@ class Orchestrator:
                     continue
 
                 if self._position is None:
-                    side_choice = random.choice(["long", "short"])
+                    if self._last_price is None:
+                        await asyncio.sleep(0.5)
+                        continue
+
+                    decision = self.strategy.decide()
+                    side_choice = str(decision.get("side", "wait"))
+                    if side_choice == "wait":
+                        await asyncio.sleep(0.8)
+                        continue
+
                     allowed, stake, info = self.risk.check_order(
                         symbol=self.cfg.symbol,
                         side=side_choice,
@@ -215,6 +236,7 @@ class Orchestrator:
                         "lev": self.cfg.leverage,
                         "vol": self.cfg.vol_profile,
                         "side": side_choice,
+                        "strategy": decision,
                     }
                     allow, conf, note = self.reasoner.evaluate(snapshot)
                     if not allow:
@@ -223,7 +245,6 @@ class Orchestrator:
                         continue
                     self.jlog.advisor(True, conf, note)
 
-                    # Apply risk-clamped leverage before opening
                     lev_to_use = int(info.get("leverage", self.cfg.leverage))
                     if lev_to_use != self.adapter.leverage:
                         self.adapter.leverage = lev_to_use
@@ -244,7 +265,6 @@ class Orchestrator:
                     self.jlog.trade_open(self.cfg.symbol, side_choice, stake, self._position.entry_price, self._position.leverage)
                     self._save_state()
                     continue
-
                 if self._position is not None:
                     if self._last_price is None:
                         await asyncio.sleep(0.5)
