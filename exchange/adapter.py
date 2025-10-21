@@ -122,33 +122,76 @@ class BitgetAdapter:
             raise RuntimeError("Bad price from ticker")
         return {"symbol": self.symbol, "price": px, "ts": t.get("timestamp", int(time.time() * 1000))}
 
-    async def get_all_open_positions(self) -> list[Dict[str, Any]]:
-        """Return all open swap-linear positions as a normalised list."""
-        def _pos_all():
-            return self.ex.fetch_positions()
+    async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Return a single open position for the given symbol (or self.symbol if omitted).
+        """
+        sym = _sym = (symbol or self.symbol)
+        def _pos():
+            # ask the exchange for this one symbol only
+            return self.ex.fetch_positions([_sym])
         try:
-            rows = await asyncio.to_thread(_pos_all)
+            rows = await asyncio.to_thread(_pos)
         except Exception as e:
-            self.log.info(f"[EX] fetch_positions(all) error: {e}")
-            return []
-        out = []
+            self.log.info(f"[EX] fetch_positions error: {e}")
+            return None
+
         for r in rows or []:
+            if r.get("symbol") != _sym:
+                continue
             amt = float(r.get("contracts", r.get("amount", 0)) or 0)
             if abs(amt) < 1e-12:
                 continue
-            sym = r.get("symbol") or ""
+            side = "long" if amt > 0 else "short"
             entry = float(r.get("entryPrice") or r.get("entry_price") or 0.0)
             lev = int(r.get("leverage") or self.leverage)
-            side = "long" if amt > 0 else "short"
-            size_usdt = abs(amt) * entry if entry > 0 else abs(amt)
-            out.append({
-                "symbol": sym,
+            size_usdt = abs(amt) * max(1.0, entry)
+            return {
+                "symbol": _sym,
                 "side": side,
                 "size_usdt": float(size_usdt),
                 "entry_price": float(entry),
                 "leverage": lev,
                 "contracts": abs(amt),
-            })
+            }
+        return None
+
+    async def get_all_open_positions(self) -> list[Dict[str, Any]]:
+        """
+        Return ALL open USDT-perp positions (any symbol) as a list of dicts with a stable shape.
+        """
+        def _pos_all():
+            # no symbol filter -> everything; ccxt returns a list
+            return self.ex.fetch_positions()
+        out: list[Dict[str, Any]] = []
+        try:
+            rows = await asyncio.to_thread(_pos_all)
+        except Exception as e:
+            self.log.info(f"[EX] fetch_positions(all) error: {e}")
+            return out
+
+        for r in rows or []:
+            try:
+                sym = str(r.get("symbol") or "")
+                if not sym:
+                    continue
+                amt = float(r.get("contracts", r.get("amount", 0)) or 0)
+                if abs(amt) < 1e-12:
+                    continue
+                side = "long" if amt > 0 else "short"
+                entry = float(r.get("entryPrice") or r.get("entry_price") or 0.0)
+                lev = int(r.get("leverage") or self.leverage)
+                size_usdt = abs(amt) * max(1.0, entry)
+                out.append({
+                    "symbol": sym,
+                    "side": side,
+                    "size_usdt": float(size_usdt),
+                    "entry_price": float(entry),
+                    "leverage": lev,
+                    "contracts": abs(amt),
+                })
+            except Exception:
+                continue
         return out
 
     def _amount_from_usdt(self, usdt: float, price: float) -> float:
