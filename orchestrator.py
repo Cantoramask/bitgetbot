@@ -208,13 +208,23 @@ class Orchestrator:
                     await asyncio.sleep(0.5)
                     continue
 
+                # --------- ENTRY LOGIC (no open position) ----------
                 if self._position is None:
                     if self._last_price is None:
                         await asyncio.sleep(0.5)
                         continue
 
+                    # Ask the strategy and LOG the decision so you can see why it waits
                     decision = self.strategy.decide()
                     side_choice = str(decision.get("side", "wait"))
+                    reason = str(decision.get("reason", ""))
+                    trail = float(decision.get("trail_pct", self._params.trail_pct_init))
+                    caution = decision.get("caution")
+
+                    # This prints lines like:
+                    # [DECIDE] side=wait trail=0.80% why=warming_up note=None
+                    self.jlog.decision(side_choice, reason, trail, cautions=caution)
+
                     if side_choice == "wait":
                         await asyncio.sleep(0.8)
                         continue
@@ -233,16 +243,13 @@ class Orchestrator:
                         await asyncio.sleep(1.0)
                         continue
 
-                    # Use the *effective* leverage (after any risk trims) for advisor + logs
-                    lev_to_use = int(info.get("leverage", self.cfg.leverage))
-
                     snapshot = {
                         "price": self._last_price,
                         "trail_init": self._params.trail_pct_init,
                         "trail_tight": self._params.trail_pct_tight,
                         "intel_sec": self._params.intelligence_sec,
                         "stake": stake,
-                        "lev": lev_to_use,
+                        "lev": self.cfg.leverage,
                         "vol": self.cfg.vol_profile,
                         "side": side_choice,
                         "strategy": decision,
@@ -254,7 +261,8 @@ class Orchestrator:
                         continue
                     self.jlog.advisor(True, conf, note)
 
-                    # Make sure adapter is set to the leverage we will actually use.
+                    # Apply any leverage clamp from RiskManager
+                    lev_to_use = int(info.get("leverage", self.cfg.leverage))
                     if lev_to_use != self.adapter.leverage:
                         self.adapter.leverage = lev_to_use
                         try:
@@ -268,28 +276,18 @@ class Orchestrator:
                         self.jlog.warn("open_failed")
                         await asyncio.sleep(1.0)
                         continue
-
-                    # Ensure the Position we store/log shows the leverage we actually used.
-                    raw.pop("order", None)
-                    raw["leverage"] = lev_to_use
-
-                    # In live mode, re-read the exchange position to capture its final leverage/avg price.
-                    if self.adapter.live:
-                        try:
-                            fresh = await self.adapter.get_open_position()
-                            if fresh and fresh.get("symbol") == self.cfg.symbol:
-                                fresh.pop("order", None)
-                                fresh["leverage"] = int(fresh.get("leverage", lev_to_use) or lev_to_use)
-                                raw = fresh
-                        except Exception as e:
-                            self.jlog.warn("refresh_position_warn", error=str(e))
-
                     self._position = Position(**raw)  # type: ignore[arg-type]
                     self._last_action_ts = now
                     self.risk.set_last_side(side_choice)
                     self.jlog.trade_open(self.cfg.symbol, side_choice, stake, self._position.entry_price, self._position.leverage)
                     self._save_state()
                     continue
+
+                # --------- EXIT LOGIC (when a position is open) ----------
+                if self._position is not None:
+                    if self._last_price is None:
+                        await asyncio.sleep(0.5)
+                        continue
 
                     pos = self._position
                     direction = 1 if pos.side == "long" else -1
