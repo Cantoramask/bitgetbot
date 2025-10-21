@@ -78,6 +78,8 @@ class Orchestrator:
         self._position: Optional[Position] = None
 
         self._params = self._make_params_from_vol_profile(self.cfg.vol_profile)
+        # leverage tighten at startup
+        self._apply_leverage_tighten(int(self.cfg.leverage))
 
         self.feeder = DataFeeder(self.adapter, window=1200, poll_sec=1.0)
         self.strategy = TrendStrategy(
@@ -87,6 +89,8 @@ class Orchestrator:
             min_trail=self._params.min_trail_init,
             max_trail=self._params.max_trail_init
         )
+        # reflect leverage inside strategy
+        self.strategy.set_leverage(int(self.cfg.leverage))
 
         self._wins = 0
         self._losses = 0
@@ -153,6 +157,30 @@ class Orchestrator:
 
     def _clamp(self, val, lo, hi):
         return max(lo, min(hi, val))
+
+    def _apply_leverage_tighten(self, lev: int) -> None:
+        l = max(1, int(lev))
+        f = l ** 0.5
+        # tighten trails, shorten ATR window, speed up intelligence, shorten reopen cooldown slightly
+        self._params.trail_pct_init = self._clamp(self._params.trail_pct_init / f, self._params.min_trail_init, self._params.max_trail_init)
+        self._params.trail_pct_tight = self._clamp(self._params.trail_pct_tight / f, self._params.min_trail_tight, self._params.max_trail_tight)
+        self._params.atr_len = self._clamp(int(round(self._params.atr_len / f)), self._params.min_atr_len, self._params.max_atr_len)
+        self._params.intelligence_sec = self._clamp(int(round(self._params.intelligence_sec / f)), self._params.min_intel_sec, self._params.max_intel_sec)
+        self._params.reopen_cooldown_sec = self._clamp(int(round(self._params.reopen_cooldown_sec / f**0.5)), self._params.min_cooldown, self._params.max_cooldown)
+        # speed up feeder polling
+        try:
+            self.feeder.set_poll_sec(max(0.2, 1.0 / f))
+        except Exception:
+            pass
+        # speed up strategy windows and set leverage for trail computation
+        try:
+            self.strategy.set_leverage(l)
+            self.strategy.set_windows(max(5, int(20 / f)), max(10, int(50 / f)))
+            self.strategy.set_atr_len(self._params.atr_len)
+        except Exception:
+            pass
+        # record
+        self.jlog.knob_change("lev_tighten_factor", round(f, 4), round(f, 4), "lev_tighten")
 
     def _auto_tune_params(self):
         sr = self._success_rate
@@ -250,9 +278,12 @@ class Orchestrator:
                         "intel_sec": self._params.intelligence_sec,
                         "stake": stake,
                         "lev": self.cfg.leverage,
+                        "lev_tighten": True,
                         "vol": self.cfg.vol_profile,
                         "side": side_choice,
                         "strategy": decision,
+                        "effective_notional": info.get("effective_notional_usdt"),
+                        "cooldowns": info.get("cooldowns"),
                     }
                     allow, conf, note = self.reasoner.evaluate(snapshot)
                     if not allow:
@@ -261,10 +292,11 @@ class Orchestrator:
                         continue
                     self.jlog.advisor(True, conf, note)
 
-                    # Apply any leverage clamp from RiskManager
+                    # Apply any leverage clamp from RiskManager and tighten params if changed
                     lev_to_use = int(info.get("leverage", self.cfg.leverage))
                     if lev_to_use != self.adapter.leverage:
                         self.adapter.leverage = lev_to_use
+                        self._apply_leverage_tighten(lev_to_use)
                         try:
                             if self.adapter.live:
                                 await asyncio.to_thread(self.adapter.ex.set_leverage, lev_to_use, self.adapter.symbol)
