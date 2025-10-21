@@ -248,38 +248,46 @@ async def _async_main():
     # 1) Takeover prompt exactly as requested
     takeover = _ask_yes_no(
         f"Open perpetual positions detected ({default_symbol}). Take over management now using existing size and leverage?",
-        default_yes=None  # no [Y] or [N] displayed on this one
+        default_yes=None
     )
 
-    # 2) Symbol format examples block (pure print, no input yet)
-    examples = textwrap.dedent(
-        """\
-        Symbol format examples:
-          BTC/USDT:USDT  Bitget perpetuals
-          BTC/USDT       auto adds :USDT
-          BTCUSDT        converts to BTC/USDT:USDT
-          BTC            converts to BTC/USDT:USDT"""
-    )
-    print(examples)
+    if takeover:
+        # Skip ALL further prompts; use environment/defaults
+        symbol_in = default_symbol
+        live_in = default_live_env
+        stake_in = default_stake
+        lev_in = default_lev
+        margin_in = default_margin
+        vol_in = default_vol
+    else:
+        # 2) Symbol format examples block (pure print, no input yet)
+        examples = textwrap.dedent(
+            """\
+            Symbol format examples:
+              BTC/USDT:USDT  Bitget perpetuals
+              BTC/USDT       auto adds :USDT
+              BTCUSDT        converts to BTC/USDT:USDT
+              BTC            converts to BTC/USDT:USDT"""
+        )
+        print(examples)
 
-    # 3) Symbol [BTC/USDT:USDT]:
-    symbol_in = _ask("Symbol", default_symbol)
+        # 3) Symbol [BTC/USDT:USDT]:
+        symbol_in = _ask("Symbol", default_symbol)
 
-    # 4) Live trading? (Y/N) [N]:
-    live_in = _ask_yes_no("Live trading?", default_yes=False if not default_live_env else True)
+        # 4) Live trading? (Y/N) [N]:
+        live_in = _ask_yes_no("Live trading?", default_yes=False if not default_live_env else True)
 
-    # 5) USDT margin per trade [50.0]:
-    stake_in = _ask("USDT margin per trade", default_stake)
+        # 5) USDT margin per trade [50.0]:
+        stake_in = _ask("USDT margin per trade", default_stake)
 
-    # 6) Leverage x [5]:
-    lev_in = _ask("Leverage x", default_lev)
+        # 6) Leverage x [5]:
+        lev_in = _ask("Leverage x", default_lev)
 
-    # 7) Margin mode cross or isolated [cross]:
-    margin_in = _ask("Margin mode cross or isolated", default_margin)
+        # 7) Margin mode cross or isolated [cross]:
+        margin_in = _ask("Margin mode cross or isolated", default_margin)
 
-    # 8) Volatility profile [High/Medium/Low] (default Medium):
-    # User can type High, Medium, or Low; default is Medium when blank.
-    vol_in = input("Volatility profile [High/Medium/Low] (default Medium): ").strip() or default_vol
+        # 8) Volatility profile [High/Medium/Low] (default Medium):
+        vol_in = input("Volatility profile [High/Medium/Low] (default Medium): ").strip() or default_vol
 
     # Build config
     cfg = AppConfig.from_inputs(
