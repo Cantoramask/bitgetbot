@@ -49,6 +49,7 @@ class BitgetAdapter:
         })
         self._markets = None
         self._market = None
+        self._lev_verified_ts = 0.0
         
     async def get_open_position(self, symbol: str):
         """
@@ -97,6 +98,7 @@ class BitgetAdapter:
             # set leverage; if Bitget rejects, step down to the highest allowed
             try:
                 await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
+                self._lev_verified_ts = time.time()
             except Exception as e:
                 # probe max allowed: try descending until it sticks
                 max_lev = int(self._market.get("limits", {}).get("leverage", {}).get("max") or self.leverage)
@@ -106,6 +108,7 @@ class BitgetAdapter:
                         await asyncio.to_thread(self.ex.set_leverage, lev, self.symbol)
                         self.leverage = lev
                         probed = True
+                        self._lev_verified_ts = time.time()
                         self.log.info(f"[EX] leverage set to {lev} after adjust")
                         break
                     except Exception:
@@ -210,7 +213,19 @@ class BitgetAdapter:
             amount = min_amt
         return float(amount)
 
+    async def _ensure_leverage_applied(self) -> None:
+        if not self.live:
+            return
+        # if leverage was set long ago, refresh to be safe at high lev
+        if time.time() - self._lev_verified_ts > 30:
+            try:
+                await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
+                self._lev_verified_ts = time.time()
+            except Exception as e:
+                self.log.info(f"[EX] reapply leverage warn: {e}")
+
     async def place_order(self, side: str, usdt: float) -> Optional[Dict[str, Any]]:
+        await self._ensure_leverage_applied()
         t = await self.fetch_ticker()
         price = float(t["price"])
         amount = self._amount_from_usdt(usdt, price)
@@ -233,7 +248,11 @@ class BitgetAdapter:
             o = await asyncio.to_thread(_order)
         except Exception as e:
             self.log.info(f"[EX] create_order error: {e}")
-            return None
+            # single fast retry at high leverage
+            try:
+                o = await asyncio.to_thread(_order)
+            except Exception:
+                return None
 
         filled = float(o.get("filled", amount) or amount)
         avg = float(o.get("average", price) or price)
