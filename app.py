@@ -30,6 +30,7 @@ import textwrap
 import logging
 import signal
 from dataclasses import dataclass
+from exchange.adapter import BitgetAdapter
 
 # Optional: load .env if present
 try:
@@ -245,9 +246,28 @@ async def _async_main():
     default_margin = os.getenv("MARGIN_MODE", "cross")
     default_vol = _normalize_vol(os.getenv("VOL_PROFILE", "Medium"))
 
+    # Try to detect a live open position’s symbol for a nicer prompt
+    detected_symbol = None
+    try:
+        tmp_adapter = BitgetAdapter(
+            logger=_setup_logging(),
+            symbol=default_symbol,
+            leverage=int(default_lev),
+            margin_mode=default_margin,
+            live=os.getenv("LIVE", "").lower() in ("1", "true", "y", "yes"),
+        )
+        await tmp_adapter.connect()
+        pos = await tmp_adapter.get_open_position()
+        if pos and pos.get("symbol"):
+            detected_symbol = str(pos["symbol"])
+    except Exception:
+        pass
+
+    prompt_symbol = detected_symbol or default_symbol
+
     # 1) Takeover prompt exactly as requested
     takeover = _ask_yes_no(
-        f"Open perpetual positions detected ({default_symbol}). Take over management now using existing size and leverage?",
+        f"Open perpetual positions detected ({prompt_symbol}). Take over management now using existing size and leverage?",
         default_yes=None
     )
 
