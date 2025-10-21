@@ -77,6 +77,16 @@ class DataFeeder:
         arr = self.prices(n)
         return {"count": len(arr), "prices": arr, "last": arr[-1] if arr else None}
 
+    def atr_pct(self, n:int=120) -> Optional[float]:
+        rows = self.prices(n + 1)
+        if len(rows) < 2:
+            return None
+        diffs = []
+        for i in range(1, len(rows)):
+            a = rows[i-1]; b = rows[i]
+            diffs.append(abs(b - a) / max(1.0, a))
+        return (sum(diffs) / len(diffs)) if diffs else None
+
 class _suppress:
     def __init__(self, *exc):
         self.exc = exc
