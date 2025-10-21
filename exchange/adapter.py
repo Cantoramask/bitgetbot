@@ -49,7 +49,25 @@ class BitgetAdapter:
         })
         self._markets = None
         self._market = None
-
+        
+    async def get_open_position(self, symbol: str):
+        """
+        Return the first open position for a given symbol (or None).
+        Used only by app.py takeover check.
+        """
+        try:
+            # Bitget’s fetch_positions() expects a list
+            positions = await asyncio.to_thread(self.ex.fetch_positions, [symbol])
+            if not positions:
+                return None
+            for p in positions:
+                if float(p.get("contracts", 0)) > 0 or abs(float(p.get("positionAmt", 0))) > 0:
+                    return p
+            return None
+        except Exception as e:
+            self.logger.info(f"[EXC] get_open_position error: {e}")
+            return None
+            
     async def connect(self):
         await self._ensure_markets()
         await self._ensure_symbol_ready()
