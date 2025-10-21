@@ -54,7 +54,7 @@ class AppConfig:
     leverage: int
     live: bool
     margin_mode: str
-    vol_profile: str  # "High" | "Medium" | "Low"
+    vol_profile: str  # "auto" | "High" | "Medium" | "Low"
     takeover: bool    # whether to take over an open position if detected
     intelligence_check_sec: int = 10
 
@@ -75,7 +75,7 @@ class AppConfig:
             leverage=leverage if leverage is not None else int(os.getenv("LEVERAGE", "5")),
             live=bool(live) if live is not None else os.getenv("LIVE", "false").lower() in ("1", "true", "y", "yes"),
             margin_mode=(margin_mode or os.getenv("MARGIN_MODE", "cross")).lower(),
-            vol_profile=_normalize_vol(vol_profile or os.getenv("VOL_PROFILE", "Medium")),
+            vol_profile=_normalize_vol(vol_profile or os.getenv("VOL_PROFILE", "auto")),
             takeover=bool(takeover),
             intelligence_check_sec=intelligence_check_sec if intelligence_check_sec is not None else int(os.getenv("INTELLIGENCE_CHECK_SEC", "10")),
         )
@@ -127,6 +127,8 @@ def _normalize_symbol(sym: str) -> str:
 
 def _normalize_vol(v: str) -> str:
     v = (v or "").strip().lower()
+    if v in ("auto",):
+        return "auto"
     if v in ("h", "high"):
         return "High"
     if v in ("l", "low"):
@@ -244,7 +246,7 @@ async def _async_main():
     default_lev = os.getenv("LEVERAGE", "5")
     default_live_env = os.getenv("LIVE", "").lower() in ("1", "true", "y", "yes")
     default_margin = os.getenv("MARGIN_MODE", "cross")
-    default_vol = _normalize_vol(os.getenv("VOL_PROFILE", "Medium"))
+    default_vol = _normalize_vol(os.getenv("VOL_PROFILE", "auto"))
 
     # Detect real open positions FIRST; only ask to take over if there are any
     chosen_symbol = None
@@ -301,7 +303,7 @@ async def _async_main():
         stake_in = default_stake
         lev_in = default_lev
         margin_in = default_margin
-        vol_in = default_vol
+        vol_in = "auto"
     else:
         examples = textwrap.dedent(
             """\
@@ -317,7 +319,7 @@ async def _async_main():
         stake_in = _ask("USDT margin per trade", default_stake)
         lev_in = _ask("Leverage x", default_lev)
         margin_in = _ask("Margin mode cross or isolated", default_margin)
-        vol_in = input("Volatility profile [High/Medium/Low] (default Medium): ").strip() or default_vol
+        vol_in = "auto"
 
     # Build config
     cfg = AppConfig.from_inputs(
