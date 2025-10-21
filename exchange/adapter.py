@@ -118,9 +118,15 @@ class BitgetAdapter:
 
     def _amount_from_usdt(self, usdt: float, price: float) -> float:
         amount = float(usdt) / max(1.0, float(price))
-        prec = self._market["precision"]["amount"]
-        step = 10 ** (-prec)
-        amount = math.floor(amount / step) * step
+        try:
+            # Use ccxt’s precision logic for this market/symbol
+            amount = float(self.ex.amount_to_precision(self.symbol, amount))
+        except Exception:
+            # Fallback: treat precision.amount as a step size (e.g. 0.0001)
+            prec = self._market["precision"].get("amount", None)
+            if isinstance(prec, (int, float)) and prec > 0:
+                step = float(prec)
+                amount = math.floor(amount / step) * step
         min_amt = float(self._market["limits"]["amount"]["min"] or 0)
         if amount < min_amt:
             amount = min_amt
