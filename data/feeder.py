@@ -27,6 +27,10 @@ class DataFeeder:
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
 
+    def set_poll_sec(self, sec: float) -> None:
+        # adjust poll interval at runtime
+        self.poll_sec = max(0.1, float(sec))
+
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
