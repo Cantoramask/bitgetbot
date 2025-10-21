@@ -265,6 +265,7 @@ class Orchestrator:
                         self.jlog.warn("open_failed")
                         await asyncio.sleep(1.0)
                         continue
+                    raw.pop("order", None)
                     self._position = Position(**raw)  # type: ignore[arg-type]
                     self._last_action_ts = now
                     self.risk.set_last_side(side_choice)
