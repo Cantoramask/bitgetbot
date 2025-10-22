@@ -329,7 +329,9 @@ class Orchestrator:
 
                     # Emergency exit: protects very high leverage positions
                     direction = 1 if pos.side == "long" else -1
-                    change_pct = direction * (self._last_price - pos.entry_price) / max(1.0, pos.entry_price)
+                    # FIX: compute percent change relative to the entry price (works for low-priced coins)
+                    denom = pos.entry_price if (pos.entry_price and pos.entry_price > 0) else 1e-9
+                    change_pct = direction * (self._last_price - pos.entry_price) / denom
                     emergency_trigger = max(0.003, 0.03 / max(1, int(pos.leverage)))  # 0.3 percent floor; scales down with leverage
                     if change_pct <= -emergency_trigger:
                         pnl = await self.adapter.close_position(asdict(pos))
