@@ -145,18 +145,44 @@ class Orchestrator:
                 raw = await self.adapter.get_open_position(self.adapter.symbol)
                 if raw and raw.get("symbol") == self.adapter.symbol:
                     self._position = Position(**raw)  # type: ignore[arg-type]
+
+                    # Align leverage to live position
                     try:
                         self.cfg.leverage = int(self._position.leverage)
                     except Exception:
                         pass
                     self.adapter.leverage = int(self.cfg.leverage)
+
                     if self.adapter.live:
                         try:
                             await asyncio.to_thread(self.adapter.ex.set_leverage, self.adapter.leverage, self.adapter.symbol)
                         except Exception as se:
                             self.jlog.warn("set_leverage_warn", error=str(se))
+
                     self.risk.set_last_side(self._position.side)
-                    self.jlog.heartbeat(status="takeover", side=self._position.side, size_usdt=self._position.size_usdt, lev=self._position.leverage)
+
+                    # Log an explicit "actual" config snapshot reflecting the live position
+                    try:
+                        actual_notional = float(self._position.size_usdt)
+                    except Exception:
+                        actual_notional = 0.0
+                    try:
+                        ep = float(self._position.entry_price)
+                    except Exception:
+                        ep = 0.0
+
+                    self.logger.info(
+                        f"[CFG-ACTUAL] symbol={self.adapter.symbol} stake=existing lev={self.cfg.leverage} "
+                        f"live={self.adapter.live} margin={self.adapter.margin_mode} "
+                        f"position_side={self._position.side} entry_price={ep} size_usdt={actual_notional:.6f} takeover=True"
+                    )
+
+                    self.jlog.heartbeat(
+                        status="takeover",
+                        side=self._position.side,
+                        size_usdt=self._position.size_usdt,
+                        lev=self._position.leverage
+                    )
                 else:
                     self.jlog.heartbeat(status="takeover_none")
             except Exception as e:
@@ -180,11 +206,13 @@ class Orchestrator:
             asyncio.create_task(self._heartbeat(), name="heartbeat"),
             asyncio.create_task(self._regime_cycle(), name="regime_cycle"),
         ]
+
         try:
-            await self._stop.wait()
+            await asyncio.gather(*tasks)
         finally:
             for t in tasks:
-                t.cancel()
+                if not t.done():
+                    t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(*tasks)
             with contextlib.suppress(Exception):

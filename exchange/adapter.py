@@ -108,11 +108,16 @@ class BitgetAdapter:
 
     async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Return a single open position for the given symbol.
+        Return the single open position for the given symbol, normalised for the orchestrator.
+        Fields returned:
+          symbol, side ("long"/"short"), size_usdt (notional), entry_price, leverage, contracts
         """
-        sym = _sym = (symbol or self.symbol)
+        _sym = symbol or self.symbol
+
         def _pos():
+            # ccxt returns a list of position dicts
             return self.ex.fetch_positions([_sym])
+
         try:
             rows = await asyncio.to_thread(_pos)
         except Exception as e:
@@ -120,29 +125,60 @@ class BitgetAdapter:
             return None
 
         for r in rows or []:
-            if r.get("symbol") != _sym:
+            try:
+                if str(r.get("symbol") or "") != _sym:
+                    continue
+
+                # contracts/amount: positive long, negative short across most ccxt derivatives
+                amt = float(r.get("contracts", r.get("amount", 0)) or 0.0)
+                if abs(amt) < 1e-12:
+                    continue  # empty
+
+                side = "long" if amt > 0 else "short"
+
+                # Entry price may be under different keys depending on ccxt version
+                entry = float(r.get("entryPrice") or r.get("entry_price") or r.get("avgPrice") or 0.0)
+
+                # Leverage best-effort
+                lev = int(r.get("leverage") or self.leverage)
+
+                # Notional in USDT is contracts * price.
+                # Do NOT clamp prices to >= 1.0 because many alts trade below 1 USDT.
+                px = float(entry)
+                if px <= 0:
+                    try:
+                        t = self.ex.fetch_ticker(_sym)
+                        px = float(t.get("last") or t.get("close") or 0.0)
+                    except Exception:
+                        px = 0.0
+
+                size_usdt = abs(amt) * px
+
+                return {
+                    "symbol": _sym,
+                    "side": side,
+                    "size_usdt": float(size_usdt),
+                    "entry_price": float(entry),
+                    "leverage": lev,
+                    "contracts": float(abs(amt)),
+                }
+            except Exception as inner:
+                self.log.info(f"[EX] parse_position error: {inner}")
                 continue
-            amt = float(r.get("contracts", r.get("amount", 0)) or 0)
-            if abs(amt) < 1e-12:
-                continue
-            side = "long" if amt > 0 else "short"
-            entry = float(r.get("entryPrice") or r.get("entry_price") or 0.0)
-            lev = int(r.get("leverage") or self.leverage)
-            size_usdt = abs(amt) * max(1.0, entry)
-            return {
-                "symbol": _sym,
-                "side": side,
-                "size_usdt": float(size_usdt),
-                "entry_price": float(entry),
-                "leverage": lev,
-                "contracts": abs(amt),
-            }
+
         return None
 
     async def get_all_open_positions(self) -> list[Dict[str, Any]]:
+        """
+        Return all open positions in normalised form.
+        Each item has:
+          symbol, side ("long"/"short"), size_usdt, entry_price, leverage, contracts
+        """
+        out: list[Dict[str, Any]] = []
+
         def _pos_all():
             return self.ex.fetch_positions()
-        out: list[Dict[str, Any]] = []
+
         try:
             rows = await asyncio.to_thread(_pos_all)
         except Exception as e:
@@ -154,23 +190,38 @@ class BitgetAdapter:
                 sym = str(r.get("symbol") or "")
                 if not sym:
                     continue
-                amt = float(r.get("contracts", r.get("amount", 0)) or 0)
+
+                amt = float(r.get("contracts", r.get("amount", 0)) or 0.0)
                 if abs(amt) < 1e-12:
                     continue
+
                 side = "long" if amt > 0 else "short"
-                entry = float(r.get("entryPrice") or r.get("entry_price") or 0.0)
+                entry = float(r.get("entryPrice") or r.get("entry_price") or r.get("avgPrice") or 0.0)
                 lev = int(r.get("leverage") or self.leverage)
-                size_usdt = abs(amt) * max(1.0, entry)
+
+                # Same notional logic, no clamping
+                px = float(entry)
+                if px <= 0:
+                    try:
+                        t = self.ex.fetch_ticker(sym)
+                        px = float(t.get("last") or t.get("close") or 0.0)
+                    except Exception:
+                        px = 0.0
+
+                size_usdt = abs(amt) * px
+
                 out.append({
                     "symbol": sym,
                     "side": side,
                     "size_usdt": float(size_usdt),
                     "entry_price": float(entry),
                     "leverage": lev,
-                    "contracts": abs(amt),
+                    "contracts": float(abs(amt)),
                 })
-            except Exception:
+            except Exception as inner:
+                self.log.info(f"[EX] parse_position(all) error: {inner}")
                 continue
+
         return out
 
     def _amount_from_usdt(self, usdt: float, price: float) -> float:
