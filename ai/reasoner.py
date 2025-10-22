@@ -108,21 +108,31 @@ class Reasoner:
         }
         allow, confidence, note = self.evaluate(snap)
 
-        # Three-tier logic:
-        # - confidence < 0.50  -> BLOCK (advisor_block)
-        # - 0.50 <= confidence < 0.70 -> WARN but allow (advisor_warn)
-        # - confidence >= 0.70 -> OK
-        hard_block = (confidence < 0.50) or (not allow)
+        # Only block if the advisor is VERY unsure (<0.30) or explicitly says it can't manage.
+        txt = (note or "").lower()
+        says_cant_manage = any(k in txt for k in ("cannot manage", "can't manage", "unmanageable", "do not trade", "do not proceed"))
+        hard_block = (confidence < 0.30) or says_cant_manage
 
         if hard_block:
             side = "wait"
             reason = "advisor_block"
             decision = {"allow": False, "confidence": float(confidence), "note": note}
-        elif confidence < 0.70:
+            return side, reason, float(params.trail_pct_init), decision
+
+        # Warn-but-allow band: 0.30 <= confidence < 0.70
+        if confidence < 0.70:
             reason = "advisor_warn"
+            # Auto-tighten when advisor is uneasy
+            tighten = 0.7  # 30% tighter
+            try:
+                params.trail_pct_init = max(params.min_trail_init, params.trail_pct_init * tighten)
+                params.trail_pct_tight = max(params.min_trail_tight, params.trail_pct_tight * tighten)
+                params.intelligence_sec = max(5, int(params.intelligence_sec * 0.6))
+            except Exception:
+                pass
             decision = {"allow": True, "confidence": float(confidence), "note": note}
         else:
-            # confident approval
+            # Confident approval
             decision = {"allow": True, "confidence": float(confidence), "note": note}
 
         return side, reason, float(params.trail_pct_init), decision
