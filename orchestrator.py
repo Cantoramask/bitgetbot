@@ -476,7 +476,7 @@ class Orchestrator:
                     "volatility": ctx.get("volatility"),
                 })
                 self.jlog.heartbeat(**st)
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)
         except asyncio.CancelledError:
             raise
         except Exception as e:

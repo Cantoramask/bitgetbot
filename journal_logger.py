@@ -59,6 +59,19 @@ class JournalLogger:
         self.jsonl = jsonl or JsonlJournal("events")
         # Minimal mode hides noisy advisory or tuning chatter
         self.minimal = os.getenv("LOG_MINIMAL", "false").lower() in ("1", "true", "y", "yes")
+        # Throttle settings (seconds). You asked for ~30s unless an actual decision is made.
+        try:
+            self.hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "30")))
+        except Exception:
+            self.hb_interval = 30
+        try:
+            self.decide_interval = int(float(os.getenv("DECISION_INTERVAL_SEC", "30")))
+        except Exception:
+            self.decide_interval = 30
+        # Internal timers and last-signatures for de-duplication
+        self._last_hb_ts: float = 0.0
+        self._last_decide_ts: float = 0.0
+        self._last_decide_sig: Optional[str] = None
 
     # ------------
     # Low-level
@@ -92,18 +105,35 @@ class JournalLogger:
         self._write("info", msg, "shutdown", {})
 
     def heartbeat(self, **fields: Any) -> None:
+        # Throttle heartbeats to every hb_interval seconds unless it's a notable status.
+        notable = str(fields.get("status", "")).lower() in {
+            "open", "close", "takeover", "emergency_exit", "trail_exit", "partial_close", "open_failed", "open_failed_after_flip"
+        }
+        now = time.time()
+        if not notable and (now - self._last_hb_ts) < max(1, self.hb_interval):
+            return
+        self._last_hb_ts = now
         msg = "[HB] " + " ".join(f"{k}={fields[k]}" for k in sorted(fields))
         self._write("info", msg, "heartbeat", fields)
 
     def decision(self, side: str, reason: str, trail_pct: float, cautions: Optional[str] = None) -> None:
         if self.minimal:
             return
-        # Ensure any advisory text is one-line and short for clean logs.
+        # Clean one-line note
         note = cautions
         if isinstance(note, str):
             note = " ".join(note.split())
             if len(note) > 300:
                 note = note[:300]
+        # Build signature to avoid repeating identical "wait" spam
+        sig = f"{side}|{reason}|{round(trail_pct,6)}|{note or ''}"
+        now = time.time()
+        is_wait = (side == "wait")
+        # Log immediately if it's not 'wait' (a real decision), or the signature changed; otherwise throttle.
+        if is_wait and sig == self._last_decide_sig and (now - self._last_decide_ts) < max(1, self.decide_interval):
+            return
+        self._last_decide_sig = sig
+        self._last_decide_ts = now
         msg = f"[DECIDE] side={side} trail={trail_pct:.4%} why={reason}" + (f" note={note}" if note else "")
         self._write("info", msg, "decision", {"side": side, "trail_pct": trail_pct, "reason": reason, "cautions": note})
 
