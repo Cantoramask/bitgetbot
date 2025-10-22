@@ -120,6 +120,10 @@ class Orchestrator:
         self._initial_risk_abs = None  # price distance at entry for 1R
         self._entry_usdt = 0.0
 
+    async def run(self):
+        """Compatibility wrapper so the launcher can call orchestrator.run()."""
+        return await self.start()
+
     async def start(self):
         self.logger.info("[BOOT] starting orchestrator")
         await self.adapter.connect()
