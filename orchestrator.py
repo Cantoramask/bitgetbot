@@ -355,21 +355,76 @@ class Orchestrator:
                                     self._position = Position(**newp)  # type: ignore[arg-type]
                                 self.jlog.partial_close(self.cfg.symbol, pos.side, fraction=float(os.getenv("TP2_FRACTION", "0.30")), at_r=2.0, price=float(self._last_price), reason="partial_close_2R")
 
-                    # Emergency exit: protects very high leverage positions
+                   # Emergency exit: protects very high leverage positions
                     direction = 1 if pos.side == "long" else -1
-                    # FIX: compute percent change relative to the entry price (works for low-priced coins)
+                    # correct denom so percent change is relative to entry price (works for small-priced coins)
                     denom = pos.entry_price if (pos.entry_price and pos.entry_price > 0) else 1e-9
                     change_pct = direction * (self._last_price - pos.entry_price) / denom
-                    emergency_trigger = max(0.003, 0.03 / max(1, int(pos.leverage)))  # 0.3 percent floor; scales down with leverage
+                    emergency_trigger = max(0.003, 0.03 / max(1, int(pos.leverage)))  # 0.3% floor; scales with lev
+
                     if change_pct <= -emergency_trigger:
+                        # Try to FLIP first (only if advisor confidence says it can manage)
+                        flip_side = "short" if pos.side == "long" else "long"
+                        snap = {
+                            "side": flip_side,
+                            "trail_init": self._params.trail_pct_init,
+                            "trail_tight": self._params.trail_pct_tight,
+                            "intel_sec": self._params.intelligence_sec,
+                            "lev": int(self.cfg.leverage),
+                            "funding": self._context_block().get("funding"),
+                            "open_interest": self._context_block().get("open_interest"),
+                            "volatility": self._context_block().get("volatility"),
+                        }
+                        allow, conf, note = self.reasoner.evaluate(snap)
+
+                        # Always CLOSE to stop the bleed; then optionally flip if advisor says it can manage (conf ≥ 0.60)
                         pnl = await self.adapter.close_position(asdict(pos))
                         self._position = None
                         self._last_action_ts = time.time()
                         self.risk.note_exit()
                         if pnl is not None and pnl < 0:
                             self.risk.register_fill(pnl_usdt=float(pnl or 0.0))
-                        self.jlog.trade_close(self.cfg.symbol, pos.side, float(self._entry_usdt or pos.size_usdt), float(self._last_price or pos.entry_price), float(pnl or 0.0), self._wins, self._losses, self._success_rate, reason="emergency_exit")
+                        self.jlog.trade_close(
+                            self.cfg.symbol, pos.side,
+                            float(self._entry_usdt or pos.size_usdt),
+                            float(self._last_price or pos.entry_price),
+                            float(pnl or 0.0),
+                            self._wins, self._losses, self._success_rate,
+                            reason="emergency_exit"
+                        )
                         self._save_state()
+
+                        # Flip only if advisor is comfortable enough to manage it
+                        if allow and float(conf) >= 0.60:
+                            try:
+                                # size: keep it sane under risk limits
+                                stake_for_flip = min(float(self.cfg.stake_usdt), self.risk.limits.max_stake_usdt)
+                                opened = await self.adapter.place_order(side=flip_side, usdt=stake_for_flip)
+                                if opened:
+                                    self._position = Position(**opened)  # type: ignore[arg-type]
+                                    self.risk.set_last_side(flip_side)
+                                    # re-seed initial risk band for partial TPs
+                                    if self._last_price:
+                                        self._initial_risk_abs = float(self._last_price) * float(self._params.trail_pct_init)
+                                    else:
+                                        self._initial_risk_abs = None
+                                    self._entry_usdt = float(self._position.size_usdt)
+                                    self._tp1_done = False
+                                    self._tp2_done = False
+                                    self.jlog.trade_open(
+                                        self.cfg.symbol, flip_side,
+                                        float(self._entry_usdt), float(self._position.entry_price),
+                                        int(self._position.leverage),
+                                        reason="flip_after_emergency"
+                                    )
+                                else:
+                                    self.jlog.warn("open_failed_after_flip")
+                            except Exception as fe:
+                                self.jlog.exception(fe, where="flip_after_emergency")
+                        else:
+                            # no flip — advisor isn’t confident; stay flat
+                            pass
+
                         await asyncio.sleep(0.5)
                         continue
 
@@ -386,7 +441,14 @@ class Orchestrator:
                             else:
                                 self._losses += 1
                                 self.risk.register_fill(pnl_usdt=float(pnl or 0.0))
-                        self.jlog.trade_close(self.cfg.symbol, pos.side, float(self._entry_usdt or pos.size_usdt), float(self._last_price or pos.entry_price), float(pnl or 0.0), self._wins, self._losses, self._success_rate, reason="trail_exit")
+                        self.jlog.trade_close(
+                            self.cfg.symbol, pos.side,
+                            float(self._entry_usdt or pos.size_usdt),
+                            float(self._last_price or pos.entry_price),
+                            float(pnl or 0.0),
+                            self._wins, self._losses, self._success_rate,
+                            reason="trail_exit"
+                        )
                         self._save_state()
                     else:
                         await asyncio.sleep(0.5)
