@@ -42,28 +42,40 @@ class Reasoner:
         if not self.enabled or not self.client:
             return True, 1.0, "disabled"
 
+        # Build a compact, deterministic prompt. Snapshot may include leverage, trails, intel_sec, funding, oi, vol.
         policy = (
             "Block if leverage is high and parameters are not tightened. "
-            "Ensure intelligence_sec is shorter at higher leverage, trails are tighter in High volatility, "
-            "and notional is within cap. If funding is extreme or volatility is mismatched with regime, lower confidence."
+            "Shorter intelligence_sec at higher leverage; smaller (tighter) trail percentages at higher leverage. "
+            "Consider funding and volatility; return cautious when mismatched."
         )
         prompt = (
-            "You are a cautious trading gate. Reply as JSON with keys allow:boolean, confidence:0..1, note:string. "
-            f"Policy: {policy}\n"
-            "Approve entries only when risk seems reasonable given leverage, stake, volatility and funding context. "
-            "Snapshot follows as JSON:\n"
-            f"{snapshot}"
+            "You are a cautious trading gate. Reply as compact JSON with keys "
+            '{"allow": boolean, "confidence": number 0..1, "note": string}. '
+            f"Policy: {policy} Snapshot: {snapshot}"
         )
+
         try:
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
             )
-            content = resp.choices[0].message.content or ""
-            allow = "true" in content.lower()
-            conf = 0.75 if allow else 0.55
-            return allow, conf, content[:200]
+            content = (resp.choices[0].message.content or "").strip()
+            # Try to parse JSON; fall back to heuristics if needed.
+            try:
+                import json  # local import to keep header unchanged
+                data = json.loads(content)
+                allow = bool(data.get("allow", True))
+                conf = float(data.get("confidence", 0.75 if allow else 0.55))
+                note = str(data.get("note", ""))
+            except Exception:
+                low = content.lower()
+                allow = "allow\"?: ?true" in low or "\"allow\": true" in low or "allow: true" in low
+                conf = 0.75 if allow else 0.55
+                note = content
+            # One-line, trimmed note for logs
+            note_oneline = " ".join(str(note).split())[:300]
+            return allow, conf, note_oneline
         except Exception as e:
             return True, 1.0, f"advisor_error: {e}"
 
@@ -84,7 +96,6 @@ class Reasoner:
                     reason = "strategy_suggest"
                 elif hasattr(strategy, "vote"):
                     v = strategy.vote()
-                    # Expect v to be a dict or tuple; fall back safely
                     if isinstance(v, dict):
                         side = v.get("side", "wait")
                         reason = v.get("reason", "vote")
@@ -95,13 +106,28 @@ class Reasoner:
             side = "wait"
             reason = "strategy_error"
 
-        # Build snapshot for the advisor
+        # Read the real leverage from context (fallback to env only if missing)
+        try:
+            lev_real = int(context.get("leverage"))  # provided by orchestrator
+        except Exception:
+            lev_real = int(os.getenv("LEVERAGE", "5") or 5)
+
+        # Auto-tighten when leverage is high (>=20): smaller trails, faster intelligence cycle.
+        try:
+            if lev_real >= 20:
+                params.trail_pct_init = max(params.min_trail_init, params.trail_pct_init * 0.7)
+                params.trail_pct_tight = max(params.min_trail_tight, params.trail_pct_tight * 0.7)
+                params.intelligence_sec = max(2, int(params.intelligence_sec * 0.6))
+        except Exception:
+            pass
+
+        # Build snapshot for the advisor (include real leverage)
         snap = {
             "side": side,
             "trail_init": params.trail_pct_init,
             "trail_tight": params.trail_pct_tight,
             "intel_sec": params.intelligence_sec,
-            "lev": os.getenv("LEVERAGE", "5"),
+            "leverage": lev_real,
             "funding": context.get("funding"),
             "open_interest": context.get("open_interest"),
             "volatility": context.get("volatility"),
@@ -118,6 +144,21 @@ class Reasoner:
             reason = "advisor_block"
             decision = {"allow": False, "confidence": float(confidence), "note": note}
             return side, reason, float(params.trail_pct_init), decision
+
+        # Warn-but-allow band: 0.30 <= confidence < 0.70
+        if confidence < 0.70:
+            reason = "advisor_warn"
+            try:
+                params.trail_pct_init = max(params.min_trail_init, params.trail_pct_init * 0.9)
+                params.trail_pct_tight = max(params.min_trail_tight, params.trail_pct_tight * 0.9)
+                params.intelligence_sec = max(2, int(params.intelligence_sec * 0.8))
+            except Exception:
+                pass
+            decision = {"allow": True, "confidence": float(confidence), "note": note}
+        else:
+            decision = {"allow": True, "confidence": float(confidence), "note": note}
+
+        return side, reason, float(params.trail_pct_init), decision
 
         # Warn-but-allow band: 0.30 <= confidence < 0.70
         if confidence < 0.70:

@@ -259,9 +259,14 @@ class Orchestrator:
                 # --------- OPEN LOGIC (when no position) ----------
                 if self._position is None:
                     context = self._context_block()
+                    context["leverage"] = int(self.cfg.leverage)
                     side_choice, reason, trail, decision = self.reasoner.decide(self.strategy, self._params, context)
+                    note = decision.get("note")
+                    if isinstance(note, str):
+                        note = " ".join(note.split())[:300]
                     caution = decision.get("caution")
-                    self.jlog.decision(side_choice, reason, trail, cautions=((caution or "") + (f" | {decision.get('note')}" if decision.get('note') else "") or None))
+                    joined = " | ".join([x for x in [caution, note] if x])
+                    self.jlog.decision(side_choice, reason, trail, cautions=(joined if joined else None))
 
                     if side_choice == "wait":
                         await asyncio.sleep(0.8)

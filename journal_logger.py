@@ -98,8 +98,14 @@ class JournalLogger:
     def decision(self, side: str, reason: str, trail_pct: float, cautions: Optional[str] = None) -> None:
         if self.minimal:
             return
-        msg = f"[DECIDE] side={side} trail={trail_pct:.4%} why={reason}" + (f" note={cautions}" if cautions else "")
-        self._write("info", msg, "decision", {"side": side, "trail_pct": trail_pct, "reason": reason, "cautions": cautions})
+        # Ensure any advisory text is one-line and short for clean logs.
+        note = cautions
+        if isinstance(note, str):
+            note = " ".join(note.split())
+            if len(note) > 300:
+                note = note[:300]
+        msg = f"[DECIDE] side={side} trail={trail_pct:.4%} why={reason}" + (f" note={note}" if note else "")
+        self._write("info", msg, "decision", {"side": side, "trail_pct": trail_pct, "reason": reason, "cautions": note})
 
     def knob_change(self, name: str, old: Any, new: Any, why: str) -> None:
         if self.minimal:
