@@ -233,7 +233,7 @@ class Orchestrator:
                     context = self._context_block()
                     side_choice, reason, trail, decision = self.reasoner.decide(self.strategy, self._params, context)
                     caution = decision.get("caution")
-                    self.jlog.decision(side_choice, reason, trail, cautions=caution)
+                    self.jlog.decision(side_choice, reason, trail, cautions=caution, note=decision.get("note"))
 
                     if side_choice == "wait":
                         await asyncio.sleep(0.8)
