@@ -104,11 +104,25 @@ class Reasoner:
             "lev": os.getenv("LEVERAGE", "5"),
             "funding": context.get("funding"),
             "open_interest": context.get("open_interest"),
-            "volatility": context.get("volatility"),
-        }
-        allow, confidence, note = self.evaluate(snap)
-        if not allow:
-            side = "wait"
-            reason = "advisor_block"
-        decision = {"allow": allow, "confidence": float(confidence), "note": note}
-        return side, reason, float(params.trail_pct_init), decision
+          "volatility": context.get("volatility"),
+      }
+      allow, confidence, note = self.evaluate(snap)
+
+      # Three-tier logic:
+      # - confidence < 0.50  -> BLOCK (advisor_block)
+      # - 0.50 <= confidence < 0.70 -> WARN but allow (advisor_warn)
+      # - confidence >= 0.70 -> OK
+      hard_block = (confidence < 0.50) or (not allow)
+
+      if hard_block:
+          side = "wait"
+          reason = "advisor_block"
+          decision = {"allow": False, "confidence": float(confidence), "note": note}
+      elif confidence < 0.70:
+          reason = "advisor_warn"
+          decision = {"allow": True, "confidence": float(confidence), "note": note}
+      else:
+          # confident approval
+          decision = {"allow": True, "confidence": float(confidence), "note": note}
+
+      return side, reason, float(params.trail_pct_init), decision
