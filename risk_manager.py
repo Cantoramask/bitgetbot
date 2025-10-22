@@ -6,17 +6,21 @@ Seatbelt for the Bitget bot.
 Plain-English summary:
 This file protects you from silly or dangerous trades. Before any order is sent,
 the orchestrator asks RiskManager: "Is this safe, and if not, how should I trim it?"
-RiskManager checks leverage, stake size, daily loss, and cooldowns. It can block a
-trade or reduce the stake to fit the rules. After a trade closes, the orchestrator
-calls `register_fill(pnl_usdt=...)` so daily loss limits stay accurate.
+RiskManager checks stake size, daily loss, and cooldowns. It never blocks only because
+leverage is high; instead it trims stake and warns you when leverage is aggressive.
 
-Simple definitions:
-- Cooldown: a waiting period after an action before you are allowed to act again.
-- Daily loss limit: the maximum money you are prepared to lose in a single day.
-- Flip: closing a long and immediately opening a short (or the reverse).
+Definitions (plain language):
+Cooldown means a waiting time after an action before doing the next one.
+Daily loss limit means the most money you’re willing to lose in one day.
+Flip means closing a long and immediately opening a short, or the reverse.
+Reduce-only means an order that can only reduce or close a position, never add to it.
+Environment variable means a setting stored outside the code in your .env file.
 
-This module stores a tiny JSON file at data/risk_state.json to remember today's
-losses and the last time you flipped or took a loss, so cooldowns work across restarts.
+You can tune defaults with environment variables like:
+  RISK_MAX_NOTIONAL_DEFAULT=5000
+  RISK_MAX_STAKE_DEFAULT=200
+  RISK_LEVERAGE_WARN_X=30
+  RISK_MAX_NOTIONAL_SOL=8000
 """
 
 from __future__ import annotations
@@ -27,43 +31,31 @@ import time
 from dataclasses import dataclass, asdict, replace
 from typing import Optional, Dict, Any, Tuple
 
-
-# ---------------
-# Data models
-# ---------------
 @dataclass
 class RiskLimits:
-    max_leverage: int = 20
+    # No hard max leverage. We remove that concept and scale by leverage instead.
     max_stake_usdt: float = 100.0
     max_daily_loss_usdt: float = 300.0
     reopen_cooldown_sec: int = 60          # after any exit
     loss_cooldown_sec: int = 300           # after a loss
     flip_cooldown_sec: int = 120           # after switching side long<->short
-    # New leverage aware limits
     max_notional_usdt: float = 2_000.0     # cap stake * leverage
     loss_cd_scale_base_lev: int = 5        # scale loss cooldown around this lev
 
-    # Optional stake trims based on volatility profile (High/Medium/Low).
-    # The orchestrator can pass its vol_profile so we scale stakes gently.
-    vol_stake_scale_high: float = 0.8      # 80 percent of max stake in High vol
-    vol_stake_scale_medium: float = 1.0    # 100 percent in Medium vol
-    vol_stake_scale_low: float = 1.0       # 100 percent in Low vol
-
+    # Volatility aware stake trims
+    vol_stake_scale_high: float = 0.8
+    vol_stake_scale_medium: float = 1.0
+    vol_stake_scale_low: float = 1.0
 
 @dataclass
 class RiskState:
-    # Running daily figures and timestamps.
-    day_ymd: str = ""                      # e.g., "2025-10-21"
+    day_ymd: str
     realized_pnl_usdt: float = 0.0
     last_exit_ts: float = 0.0
     last_loss_ts: float = 0.0
     last_flip_ts: float = 0.0
-    last_side: str = ""                    # "long" or "short" when position last existed
+    last_side: Optional[str] = None  # "long" | "short"
 
-
-# ---------------
-# Risk manager
-# ---------------
 class RiskManager:
     def __init__(self, logger, limits: Optional[RiskLimits] = None, state_path: str = "data/risk_state.json"):
         self.logger = logger
@@ -72,20 +64,18 @@ class RiskManager:
         os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
         self.state = self._load_state()
 
-        # Per-symbol overrides loaded from environment once at startup.
-        # Examples:
-        #   RISK_MAX_LEVERAGE_DEFAULT=30
-        #   RISK_MAX_STAKE_DEFAULT=200
-        #   RISK_MAX_NOTIONAL_DEFAULT=5000
-        #   RISK_MAX_LEVERAGE_SOL=100
-        #   RISK_MAX_STAKE_SOL=500
-        #   RISK_MAX_NOTIONAL_SOL=15000
+        # Per-symbol overrides via env
+        #   RISK_MAX_STAKE_DEFAULT, RISK_MAX_NOTIONAL_DEFAULT
+        #   RISK_MAX_STAKE_SOL,     RISK_MAX_NOTIONAL_SOL
         self._overrides = self._load_overrides()
 
-        # Reduce console spam when orders are repeatedly blocked during cooldowns.
-        self._last_block_sig: Optional[str] = None
+        # Leverage warning threshold, not a cap
+        self._lev_warn_x = int(os.getenv("RISK_LEVERAGE_WARN_X", "30"))
+
+        # Anti-log-spam
+        self._last_block_sig: str = ""
         self._last_block_log_ts: float = 0.0
-        self._block_log_every_sec: int = int(os.getenv("RISK_BLOCK_LOG_EVERY_SEC", "5"))  # log at most every 5s
+        self._block_log_every_sec: int = int(os.getenv("RISK_BLOCK_LOG_EVERY_SEC", "5"))
 
     # ---- persistence ----
     def _load_state(self) -> RiskState:
@@ -95,29 +85,17 @@ class RiskManager:
             return RiskState(**raw)
         except FileNotFoundError:
             return RiskState(day_ymd=self._today())
-        except Exception as e:
-            self._safe_log(f"[RISK] failed to load state: {e}")
+        except Exception:
             return RiskState(day_ymd=self._today())
 
     def _save_state(self) -> None:
-        tmp = self.state_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(asdict(self.state), f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.state_path)
+        try:
+            with open(self.state_path, "w", encoding="utf-8") as f:
+                json.dump(asdict(self.state), f)
+        except Exception:
+            pass
 
-    # ---- basic utilities ----
-    def _today(self) -> str:
-        # Use UTC date so it is consistent for servers.
-        return time.strftime("%Y-%m-%d", time.gmtime())
-
-    def _roll_day_if_needed(self) -> None:
-        today = self._today()
-        if self.state.day_ymd != today:
-            self.state.day_ymd = today
-            self.state.realized_pnl_usdt = 0.0
-            # Leave timestamps, they still help with rapid re-entries around midnight
-            self._save_state()
-
+    # ---- helpers ----
     def _safe_log(self, msg: str) -> None:
         try:
             if self.logger:
@@ -125,110 +103,94 @@ class RiskManager:
         except Exception:
             pass
 
+    def _today(self) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime())
+
+    def _roll_day_if_needed(self) -> None:
+        today = self._today()
+        if self.state.day_ymd != today:
+            self.state.day_ymd = today
+            self.state.realized_pnl_usdt = 0.0
+            self._save_state()
+
+    def _remaining(self, last_ts: float, cd: int, now: float) -> int:
+        if cd <= 0:
+            return 0
+        if last_ts <= 0:
+            return 0
+        remain = cd - int(now - last_ts)
+        return max(0, remain)
+
     def _norm_symbol_key(self, symbol: str) -> str:
-        """Normalise symbols to a simple key like 'SOL' or 'SOLUSDT'.
-        Accepts 'SOL/USDT:USDT', 'SOL/USDT', 'SOLUSDT', 'SOL'."""
-        s = (symbol or "").upper().strip()
-        s = s.replace(":USDT", "")
-        s = s.replace("/", "")
-        # If it ends with USDT or USD, keep base only for overrides keyed by coin.
-        if s.endswith("USDT") and len(s) > 4:
-            return s[:-4]  # SOL
-        if s.endswith("USD") and len(s) > 3:
-            return s[:-3]
-        return s  # e.g. SOL
+        s = (symbol or "").upper().replace("/", "").replace(":USDT", "")
+        if s.endswith("USDT"):
+            return s
+        return s + "USDT" if s and not s.endswith("USDT") else s
 
     def _load_overrides(self) -> Dict[str, Dict[str, float]]:
-        """Load per-symbol and default overrides from environment variables."""
         ov: Dict[str, Dict[str, float]] = {}
-        def _getf(name: str) -> Optional[float]:
+
+        def _f(name: str) -> Optional[float]:
             v = os.getenv(name)
-            if v is None or v == "":
-                return None
             try:
-                return float(v)
+                return float(v) if v is not None else None
             except Exception:
                 return None
 
-        # Defaults
-        default_max_lev = _getf("RISK_MAX_LEVERAGE_DEFAULT")
-        default_max_stake = _getf("RISK_MAX_STAKE_DEFAULT")
-        default_max_notional = _getf("RISK_MAX_NOTIONAL_DEFAULT")
-        if default_max_lev or default_max_stake or default_max_notional:
+        d_max_stake = _f("RISK_MAX_STAKE_DEFAULT")
+        d_max_notional = _f("RISK_MAX_NOTIONAL_DEFAULT")
+        if d_max_stake or d_max_notional:
             ov["__DEFAULT__"] = {}
-            if default_max_lev:
-                ov["__DEFAULT__"]["max_leverage"] = int(default_max_lev)
-            if default_max_stake:
-                ov["__DEFAULT__"]["max_stake_usdt"] = float(default_max_stake)
-            if default_max_notional:
-                ov["__DEFAULT__"]["max_notional_usdt"] = float(default_max_notional)
+            if d_max_stake is not None:
+                ov["__DEFAULT__"]["max_stake_usdt"] = d_max_stake
+            if d_max_notional is not None:
+                ov["__DEFAULT__"]["max_notional_usdt"] = d_max_notional
 
-        # Per-coin like RISK_MAX_LEVERAGE_SOL, RISK_MAX_STAKE_SOL, RISK_MAX_NOTIONAL_SOL
+        # Per-coin overrides like RISK_MAX_STAKE_SOL, RISK_MAX_NOTIONAL_SOL
         for k, v in os.environ.items():
-            if not (k.startswith("RISK_MAX_LEVERAGE_") or k.startswith("RISK_MAX_STAKE_") or k.startswith("RISK_MAX_NOTIONAL_")):
+            if not (k.startswith("RISK_MAX_STAKE_") or k.startswith("RISK_MAX_NOTIONAL_")):
                 continue
             parts = k.split("_")
-            if len(parts) < 3:
-                continue
-            kind = "_".join(parts[:3]) if parts[2] == "MAX" else "_".join(parts[:2])
-            # normalise coin tail
-            coin = "_".join(parts[3:]) if parts[2] == "DEFAULT" else "_".join(parts[2:])
-            coin = coin.strip().upper()
-            if not coin:
-                continue
+            coin = parts[-1].upper()
+            coin = coin.replace(":", "").replace("/", "")
+            coin = coin if coin.endswith("USDT") else coin + "USDT"
             ov.setdefault(coin, {})
-            if k.startswith("RISK_MAX_LEVERAGE_"):
-                try:
-                    ov[coin]["max_leverage"] = int(float(v))
-                except Exception:
-                    pass
-            elif k.startswith("RISK_MAX_STAKE_"):
-                try:
+            try:
+                if k.startswith("RISK_MAX_STAKE_"):
                     ov[coin]["max_stake_usdt"] = float(v)
-                except Exception:
-                    pass
-            elif k.startswith("RISK_MAX_NOTIONAL_"):
-                try:
+                elif k.startswith("RISK_MAX_NOTIONAL_"):
                     ov[coin]["max_notional_usdt"] = float(v)
-                except Exception:
-                    pass
+            except Exception:
+                pass
         return ov
 
     def _apply_overrides(self, symbol: str, base: RiskLimits) -> RiskLimits:
-        """Return a new RiskLimits with per-symbol or default overrides applied."""
         key = self._norm_symbol_key(symbol)
         limits = replace(base)
-        # Default overrides first
         dflt = self._overrides.get("__DEFAULT__", {})
-        if "max_leverage" in dflt:
-            limits.max_leverage = int(dflt["max_leverage"])
         if "max_stake_usdt" in dflt:
             limits.max_stake_usdt = float(dflt["max_stake_usdt"])
         if "max_notional_usdt" in dflt:
             limits.max_notional_usdt = float(dflt["max_notional_usdt"])
-        # Per-coin overrides next
-        ov = self._overrides.get(key, {})
-        if "max_leverage" in ov:
-            limits.max_leverage = int(ov["max_leverage"])
-        if "max_stake_usdt" in ov:
-            limits.max_stake_usdt = float(ov["max_stake_usdt"])
-        if "max_notional_usdt" in ov:
-            limits.max_notional_usdt = float(ov["max_notional_usdt"])
+        coin = self._overrides.get(key, {})
+        if "max_stake_usdt" in coin:
+            limits.max_stake_usdt = float(coin["max_stake_usdt"])
+        if "max_notional_usdt" in coin:
+            limits.max_notional_usdt = float(coin["max_notional_usdt"])
         return limits
 
-    # ---- leverage aware helpers ----
-    def _lev_stake_scale(self, lev: int) -> float:
-        # halve stake at lev=4 to 5 and continue to decrease sublinearly
-        l = max(1, int(lev))
-        return 1.0 / (l ** 0.5)
-
-    def _scaled_loss_cd(self, base_cd: int, lev: int, base_lev: int) -> int:
-        if base_cd <= 0:
-            return 0
-        l = max(1, int(lev))
-        b = max(1, int(base_lev))
-        factor = max(1.0, (l / b) ** 0.5)
-        return int(round(base_cd * factor))
+    def _lev_stake_scale(self, leverage: int) -> float:
+        """
+        As leverage increases, reduce stake so notional stays sane.
+        We aim roughly stake * leverage <= max_notional.
+        """
+        try:
+            lev = max(1, int(leverage))
+        except Exception:
+            lev = 1
+        # Scale factor reduces stake at high lev, but never kills it.
+        # 1x -> 1.0, 5x -> ~1.0, 20x -> 0.5, 40x -> 0.3
+        return max(0.2, min(1.0, 5.0 / max(5.0, float(lev))))
 
     # ---- public API for orchestrator ----
     def check_order(
@@ -240,33 +202,30 @@ class RiskManager:
         requested_leverage: int,
         vol_profile: str = "Medium",   # "High"|"Medium"|"Low"
         now_ts: Optional[float] = None,
-        is_flip: Optional[bool] = None # if orchestrator knows it's flipping
+        is_flip: Optional[bool] = None
     ) -> Tuple[bool, float, Dict[str, Any]]:
-        """Decide if a new order is allowed, and what stake to use.
+        """
+        Decide if a new order is allowed, and what stake to use.
 
-        Returns a tuple:
-            (allowed: bool, stake_usdt: float, info: dict)
+        Returns (allowed: bool, stake_usdt: float, info: dict)
 
-        info contains reasons, any trims, and remaining cooldowns so the caller
-        can print a friendly line and journal it.
+        info.reasons holds trims/blocks, info.warnings holds non-blocking warnings.
         """
         self._roll_day_if_needed()
         now = now_ts if now_ts is not None else time.time()
         reasons = []
+        warnings = []
         allowed = True
 
-        # Apply per-symbol overrides to the base limits.
         limits = self._apply_overrides(symbol, self.limits)
 
-        # 1) Leverage fence
+        # Leverage warning only. No hard cap. We never block solely due to lev.
         lev = int(requested_leverage)
-        if lev > limits.max_leverage:
-            reasons.append(f"leverage {lev} exceeds max {limits.max_leverage}")
-            lev = limits.max_leverage
+        if lev >= self._lev_warn_x:
+            warnings.append(f"high leverage {lev}x >= warn {self._lev_warn_x}x")
 
-        # 2) Volatility-based stake scale and leverage-based scale
+        # Volatility and leverage scaling for stake
         v = (vol_profile or "Medium").lower()
-        scale_vol = 1.0
         if v == "high":
             scale_vol = limits.vol_stake_scale_high
         elif v == "low":
@@ -277,26 +236,26 @@ class RiskManager:
         scale_lev = self._lev_stake_scale(lev)
         stake = float(requested_stake_usdt) * float(scale_vol) * float(scale_lev)
 
-        # 3) Max stake fence
+        # Max stake fence
         if stake > limits.max_stake_usdt:
             reasons.append(f"stake {stake:.2f} > max_stake {limits.max_stake_usdt:.2f}, trimming")
             stake = float(limits.max_stake_usdt)
 
-        # 4) Notional fence
+        # Notional fence: stake * lev
         notional = stake * lev
         if notional > limits.max_notional_usdt:
             reasons.append(f"notional {notional:.2f} > max_notional {limits.max_notional_usdt:.2f}, trimming")
             stake = limits.max_notional_usdt / max(1, lev)
             notional = stake * lev
 
-        # 5) Daily loss check
-        daily_loss = -min(0.0, self.state.realized_pnl_usdt)  # positive number if losing
+        # Daily loss check
+        daily_loss = -min(0.0, self.state.realized_pnl_usdt)
         remaining_loss_budget = max(0.0, limits.max_daily_loss_usdt - daily_loss)
         if remaining_loss_budget <= 0.0:
             reasons.append("max daily loss reached")
             allowed = False
 
-        # 6) Cooldowns: after any exit and after a loss with leverage aware scaling
+        # Cooldowns
         remain_exit = self._remaining(self.state.last_exit_ts, limits.reopen_cooldown_sec, now)
         if remain_exit > 0:
             reasons.append(f"reopen cooldown {remain_exit}s")
@@ -308,8 +267,7 @@ class RiskManager:
             reasons.append(f"loss cooldown {remain_loss}s")
             allowed = False
 
-        # 7) Flip cooldown
-        # If the caller did not specify is_flip, infer it from last_side.
+        # Flip cooldown
         if is_flip is None:
             is_flip = self.state.last_side and self.state.last_side != side
         remain_flip = self._remaining(self.state.last_flip_ts, limits.flip_cooldown_sec, now) if is_flip else 0
@@ -328,6 +286,7 @@ class RiskManager:
             "scaled_by_leverage": scale_lev,
             "effective_notional_usdt": round(notional, 8),
             "reasons": reasons,
+            "warnings": warnings,
             "cooldowns": {
                 "reopen_sec": max(0, limits.reopen_cooldown_sec - int(now - self.state.last_exit_ts)),
                 "loss_sec": max(0, eff_loss_cd - int(now - self.state.last_loss_ts)),
@@ -338,100 +297,52 @@ class RiskManager:
             "vol_profile": vol_profile,
             "is_flip": bool(is_flip),
             "applied_limits": {
-                "max_leverage": limits.max_leverage,
                 "max_stake_usdt": limits.max_stake_usdt,
-                "max_notional_usdt": limits.max_notional_usdt,
                 "max_daily_loss_usdt": limits.max_daily_loss_usdt,
+                "max_notional_usdt": limits.max_notional_usdt,
             },
         }
 
-        # Final allow/deny
         if not allowed:
-            # Build a signature of the block reasons to avoid spamming logs.
-            sig = f"{side}|{lev}|{round(stake,2)}|{'|'.join(reasons)}"
+            sig = f"{side}|{round(stake,2)}|{'|'.join(reasons)}"
             now_ts = time.time()
             if sig != self._last_block_sig or (now_ts - self._last_block_log_ts) >= self._block_log_every_sec:
-                self._safe_log(f"[RISK] BLOCK {side} {stake:.2f}USDT lev={lev} | {'; '.join(reasons)}")
+                self._safe_log(f"[RISK] BLOCK {side} {stake:.2f}USDT | {'; '.join(reasons)}")
                 self._last_block_sig = sig
                 self._last_block_log_ts = now_ts
             return False, 0.0, info
 
-        # Allow with any trims already applied
         return True, stake, info
 
+    def _scaled_loss_cd(self, base_cd: int, lev: int, base_lev: int) -> int:
+        # At higher lev, hold you back a bit longer after a loss
+        try:
+            lev = max(1, int(lev))
+            base_lev = max(1, int(base_lev))
+        except Exception:
+            return base_cd
+        factor = min(2.5, max(0.75, lev / float(base_lev)))
+        return int(round(base_cd * factor))
+
+    # ---- notes from orchestrator ----
+    def register_fill(self, *, pnl_usdt: float) -> None:
+        self.state.realized_pnl_usdt = float(self.state.realized_pnl_usdt) + float(pnl_usdt or 0.0)
+        if pnl_usdt < 0:
+            self.state.last_loss_ts = time.time()
+        self._save_state()
+
     def note_exit(self, *, now_ts: Optional[float] = None) -> None:
-        """Call this right after a position is fully closed."""
         now = now_ts if now_ts is not None else time.time()
         self.state.last_exit_ts = now
         self._save_state()
 
     def note_flip(self, *, now_ts: Optional[float] = None) -> None:
-        """Call this if you are closing one side and immediately opening the other."""
         now = now_ts if now_ts is not None else time.time()
         self.state.last_flip_ts = now
         self._save_state()
 
     def set_last_side(self, side: str) -> None:
-        """Remember the last side we held so we can infer flips later."""
         side = (side or "").lower()
         if side in ("long", "short"):
             self.state.last_side = side
             self._save_state()
-
-    def register_fill(self, *, pnl_usdt: float, now_ts: Optional[float] = None) -> None:
-        """
-        After a trade is closed, tell the risk manager the realised profit or loss.
-        This keeps daily loss tracking correct and triggers loss cooldowns if needed.
-        """
-        self._roll_day_if_needed()
-        now = now_ts if now_ts is not None else time.time()
-        self.state.realized_pnl_usdt += float(pnl_usdt)
-
-        if pnl_usdt < 0:
-            # Start the loss cooldown only when we actually lose money
-            self.state.last_loss_ts = now
-
-        self._save_state()
-
-    # ---- helpers ----
-    def _remaining(self, start_ts: float, window_sec: int, now: float) -> int:
-        if start_ts <= 0 or window_sec <= 0:
-            return 0
-        remain = window_sec - int(now - start_ts)
-        return max(0, remain)
-
-# ---------------
-# Minimal self-test
-# ---------------
-if __name__ == "__main__":
-    class _DummyLog:
-        def info(self, *a, **k):
-            print(*a)
-
-    # Example: allow bigger leverage and stake by default and specifically for SOL.
-    os.environ.setdefault("RISK_MAX_LEVERAGE_DEFAULT", "30")
-    os.environ.setdefault("RISK_MAX_STAKE_DEFAULT", "200")
-    os.environ.setdefault("RISK_MAX_LEVERAGE_SOL", "100")
-    os.environ.setdefault("RISK_MAX_STAKE_SOL", "500")
-
-    rm = RiskManager(_DummyLog(), RiskLimits(max_leverage=20, max_stake_usdt=100, max_daily_loss_usdt=300))
-    ok, stake, info = rm.check_order(
-        symbol="SOL/USDT:USDT",
-        side="long",
-        requested_stake_usdt=120.0,
-        requested_leverage=30,
-        vol_profile="Medium"
-    )
-    print("allowed:", ok, "stake:", stake, "info:", {k: info[k] for k in ('leverage','stake_usdt','reasons','applied_limits')})
-    if ok:
-        rm.register_fill(pnl_usdt=-12.34)
-        rm.note_exit()
-        ok2, stake2, info2 = rm.check_order(
-            symbol="SOL/USDT:USDT",
-            side="short",
-            requested_stake_usdt=50.0,
-            requested_leverage=5,
-            vol_profile="Medium",
-            is_flip=True
-        )
-        print("allowed2:", ok2, "stake2:", stake2, "info2:", info2)
