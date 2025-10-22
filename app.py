@@ -58,6 +58,12 @@ class AppConfig:
     takeover: bool    # whether to take over an open position if detected
     intelligence_check_sec: int = 10
 
+    # >>> Added to satisfy orchestrator & new features (Items 1 & 10)
+    max_notional_usdt: float = 5000.0          # cap for stake * leverage (read from env)
+    tp1_fraction: float = 0.30                 # first partial take-profit fraction
+    tp2_fraction: float = 0.30                 # second partial take-profit fraction
+    context_refresh_sec: int = 30              # Item 1: funding/OI context refresh interval
+
     @staticmethod
     def from_inputs(
         symbol: str,
@@ -69,18 +75,28 @@ class AppConfig:
         takeover: bool,
         intelligence_check_sec: int | None = None,
     ) -> "AppConfig":
+        # helpers for booleans from env
+        def _env_bool(name: str, default: bool=False) -> bool:
+            return (os.getenv(name, str(default)).strip().lower() in ("1", "true", "y", "yes", "on"))
+
         return AppConfig(
             symbol=_normalize_symbol(symbol or os.getenv("SYMBOL", "BTC/USDT:USDT")),
             stake_usdt=stake_usdt if stake_usdt is not None else float(os.getenv("BASE_USDT_PER_TRADE", "50")),
-            leverage=leverage if leverage is not None else int(os.getenv("LEVERAGE", "5")),
-            live=bool(live) if live is not None else os.getenv("LIVE", "false").lower() in ("1", "true", "y", "yes"),
+            leverage=leverage if leverage is not None else int(float(os.getenv("LEVERAGE", "5"))),
+            live=bool(live) if live is not None else _env_bool("LIVE", False),
             margin_mode=(margin_mode or os.getenv("MARGIN_MODE", "cross")).lower(),
             vol_profile=_normalize_vol(vol_profile or os.getenv("VOL_PROFILE", "auto")),
             takeover=bool(takeover),
-            intelligence_check_sec=intelligence_check_sec if intelligence_check_sec is not None else int(os.getenv("INTELLIGENCE_CHECK_SEC", "10")),
+            intelligence_check_sec=(
+                intelligence_check_sec if intelligence_check_sec is not None
+                else int(float(os.getenv("INTELLIGENCE_CHECK_SEC", "10")))
+            ),
+            # >>> Added: pull new fields from env with safe defaults
+            max_notional_usdt=float(os.getenv("RISK_MAX_NOTIONAL_DEFAULT", "5000")),
+            tp1_fraction=float(os.getenv("TP1_FRACTION", "0.30")),
+            tp2_fraction=float(os.getenv("TP2_FRACTION", "0.30")),
+            context_refresh_sec=int(float(os.getenv("CONTEXT_REFRESH_SEC", "30"))),
         )
-
-
 # ---------------------------
 # Simple console + file logger
 # ---------------------------
