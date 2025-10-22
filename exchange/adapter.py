@@ -17,7 +17,7 @@ import asyncio
 import math
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import ccxt
 
@@ -50,25 +50,7 @@ class BitgetAdapter:
         self._markets = None
         self._market = None
         self._lev_verified_ts = 0.0
-        
-    async def get_open_position(self, symbol: str):
-        """
-        Return the first open position for a given symbol (or None).
-        Used only by app.py takeover check.
-        """
-        try:
-            # Bitget’s fetch_positions() expects a list
-            positions = await asyncio.to_thread(self.ex.fetch_positions, [symbol])
-            if not positions:
-                return None
-            for p in positions:
-                if float(p.get("contracts", 0)) > 0 or abs(float(p.get("positionAmt", 0))) > 0:
-                    return p
-            return None
-        except Exception as e:
-            self.logger.info(f"[EXC] get_open_position error: {e}")
-            return None
-            
+
     async def connect(self):
         await self._ensure_markets()
         await self._ensure_symbol_ready()
@@ -89,7 +71,7 @@ class BitgetAdapter:
             self.symbol = sym
         self._market = self._markets[self.symbol]
         if self.live:
-            # try set margin mode first (harmless if already correct)
+            # try set margin mode first
             try:
                 await asyncio.to_thread(self.ex.set_margin_mode, self.margin_mode, self.symbol)
             except Exception as e:
@@ -100,7 +82,6 @@ class BitgetAdapter:
                 await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
                 self._lev_verified_ts = time.time()
             except Exception as e:
-                # probe max allowed: try descending until it sticks
                 max_lev = int(self._market.get("limits", {}).get("leverage", {}).get("max") or self.leverage)
                 probed = False
                 for lev in range(min(self.leverage, max_lev), 0, -1):
@@ -127,11 +108,10 @@ class BitgetAdapter:
 
     async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Return a single open position for the given symbol (or self.symbol if omitted).
+        Return a single open position for the given symbol.
         """
         sym = _sym = (symbol or self.symbol)
         def _pos():
-            # ask the exchange for this one symbol only
             return self.ex.fetch_positions([_sym])
         try:
             rows = await asyncio.to_thread(_pos)
@@ -160,11 +140,7 @@ class BitgetAdapter:
         return None
 
     async def get_all_open_positions(self) -> list[Dict[str, Any]]:
-        """
-        Return ALL open USDT-perp positions (any symbol) as a list of dicts with a stable shape.
-        """
         def _pos_all():
-            # no symbol filter -> everything; ccxt returns a list
             return self.ex.fetch_positions()
         out: list[Dict[str, Any]] = []
         try:
@@ -198,7 +174,6 @@ class BitgetAdapter:
         return out
 
     def _amount_from_usdt(self, usdt: float, price: float) -> float:
-        # interpret usdt as margin; notional = margin * leverage
         notional = float(usdt) * max(1, int(self.leverage))
         amount = notional / max(1.0, float(price))
         try:
@@ -216,7 +191,6 @@ class BitgetAdapter:
     async def _ensure_leverage_applied(self) -> None:
         if not self.live:
             return
-        # if leverage was set long ago, refresh to be safe at high lev
         if time.time() - self._lev_verified_ts > 30:
             try:
                 await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
@@ -248,7 +222,6 @@ class BitgetAdapter:
             o = await asyncio.to_thread(_order)
         except Exception as e:
             self.log.info(f"[EX] create_order error: {e}")
-            # single fast retry at high leverage
             try:
                 o = await asyncio.to_thread(_order)
             except Exception:
@@ -298,3 +271,60 @@ class BitgetAdapter:
         direction = 1 if pos["side"] == "long" else -1
         pnl_pct = direction * (exit_px - float(pos["entry_price"])) / max(1.0, float(pos["entry_price"]))
         return float(pos["size_usdt"]) * pnl_pct
+
+    async def close_position_fraction(self, pos: Dict[str, Any], fraction: float) -> bool:
+        """
+        Reduce-only partial close. fraction is 0..1.
+        """
+        fraction = max(0.0, min(1.0, float(fraction)))
+        if fraction <= 0.0:
+            return True
+        amt = float(pos.get("contracts") or 0.0) * fraction
+        if amt <= 0:
+            return True
+
+        close_side = "sell" if pos["side"] == "long" else "buy"
+        params = {"reduceOnly": True}
+
+        if not self.live:
+            # In paper mode just say OK
+            return True
+
+        def _order():
+            return self.ex.create_order(self.symbol, "market", close_side, amt, None, params)
+        try:
+            await asyncio.to_thread(_order)
+            return True
+        except Exception as e:
+            self.log.info(f"[EX] partial_close error: {e}")
+            return False
+
+    async def fetch_funding_and_oi(self) -> Tuple[Optional[float], Optional[int], Optional[float]]:
+        """
+        Try to fetch funding rate and open interest using ccxt where available.
+        Returns (funding_rate as fraction, next_funding_ts ms, open_interest contracts or notional).
+        On failure, returns Nones.
+        """
+        fr = None
+        next_ts = None
+        oi = None
+        # Funding
+        try:
+            row = await asyncio.to_thread(self.ex.fetch_funding_rate, self.symbol)
+            # typical unified keys: fundingRate as fraction, nextFundingTime ms
+            fr = float(row.get("fundingRate")) if row and row.get("fundingRate") is not None else None
+            nft = row.get("nextFundingTime") or row.get("info", {}).get("nextFundingTime") if isinstance(row.get("info", {}), dict) else None
+            next_ts = int(nft) if nft else None
+        except Exception:
+            pass
+        # Open Interest
+        try:
+            # if exchange supports it
+            if hasattr(self.ex, "fetch_open_interest"):
+                row2 = await asyncio.to_thread(self.ex.fetch_open_interest, self.symbol)
+                # unified may use "openInterestAmount" or "openInterest"
+                raw_oi = row2.get("openInterest") or row2.get("openInterestAmount")
+                oi = float(raw_oi) if raw_oi is not None else None
+        except Exception:
+            pass
+        return fr, next_ts, oi

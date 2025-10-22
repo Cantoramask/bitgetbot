@@ -57,7 +57,7 @@ class JournalLogger:
             raise TypeError("logger must be a logging.Logger")
         self.log = logger
         self.jsonl = jsonl or JsonlJournal("events")
-        # Minimal mode hides noisy advisory/tuning chatter
+        # Minimal mode hides noisy advisory or tuning chatter
         self.minimal = os.getenv("LOG_MINIMAL", "false").lower() in ("1", "true", "y", "yes")
 
     # ------------
@@ -107,12 +107,12 @@ class JournalLogger:
         msg = f"[KNOB] {name}: {old} -> {new} ({why})"
         self._write("info", msg, "knob_change", {"name": name, "old": old, "new": new, "why": why})
 
-    def trade_open(self, symbol: str, side: str, usdt: float, price: float, lev: int) -> None:
-        msg = f"[OPEN] {symbol} {side} {usdt:.2f}USDT @ {price:.2f} x{lev}"
-        self._write("info", msg, "trade_open", {"symbol": symbol, "side": side, "usdt": usdt, "price": price, "lev": lev})
+    def trade_open(self, symbol: str, side: str, usdt: float, price: float, lev: int, *, reason: Optional[str] = None) -> None:
+        msg = f"[OPEN] {symbol} {side} {usdt:.2f}USDT @ {price:.2f} x{lev}" + (f" because {reason}" if reason else "")
+        self._write("info", msg, "trade_open", {"symbol": symbol, "side": side, "usdt": usdt, "price": price, "lev": lev, "reason": reason})
 
-    def trade_close(self, symbol: str, side: str, usdt: float, exit_price: float, pnl_usdt: float, wins: int, losses: int, success_rate: float) -> None:
-        msg = f"[CLOSE] {symbol} {side} {usdt:.2f}USDT @ {exit_price:.2f} pnl={pnl_usdt:.2f} sr={success_rate:.2f} W{wins}/L{losses}"
+    def trade_close(self, symbol: str, side: str, usdt: float, exit_price: float, pnl_usdt: float, wins: int, losses: int, success_rate: float, *, reason: Optional[str] = None) -> None:
+        msg = f"[CLOSE] {symbol} {side} {usdt:.2f}USDT @ {exit_price:.2f} pnl={pnl_usdt:.2f} sr={success_rate:.2f} W{wins}/L{losses}" + (f" because {reason}" if reason else "")
         self._write(
             "info",
             msg,
@@ -126,14 +126,19 @@ class JournalLogger:
                 "wins": wins,
                 "losses": losses,
                 "success_rate": success_rate,
+                "reason": reason,
             },
         )
+
+    def partial_close(self, symbol: str, side: str, fraction: float, at_r: float, price: float, *, reason: Optional[str] = None) -> None:
+        msg = f"[PARTIAL] {symbol} {side} {fraction:.0%} at {at_r:.1f}R @ {price:.2f}" + (f" because {reason}" if reason else "")
+        self._write("info", msg, "partial_close", {"symbol": symbol, "side": side, "fraction": fraction, "r_mult": at_r, "price": price, "reason": reason})
 
     def advisor(self, allow: bool, confidence: float, note: Optional[str] = None) -> None:
         if self.minimal:
             return
         msg = f"[ADVISOR] allow={allow} conf={confidence:.2f}"
-        self._write("info", msg, "advisor", {"allow": allow, "confidence": confidence})
+        self._write("info", msg, "advisor", {"allow": allow, "confidence": confidence, "note": note})
 
     def warn(self, note: str, **fields: Any) -> None:
         msg = f"[WARN] {note}"
@@ -169,8 +174,9 @@ if __name__ == "__main__":
     jl.heartbeat(price=100123.45, pos="none", intel_sec=10, trail_init=0.008, trail_tight=0.004)
     jl.decision(side="long", reason="trend up, pullback to MA", trail_pct=0.008)
     jl.knob_change("intelligence_sec", 10, 15, "volatility high")
-    jl.trade_open("BTC/USDT:USDT", "long", 50.0, 100100.0, 5)
-    jl.trade_close("BTC/USDT:USDT", "long", 50.0, 100250.0, 7.25, wins=3, losses=1, success_rate=0.75)
+    jl.trade_open("BTC/USDT:USDT", "long", 50.0, 100100.0, 5, reason="demo_open")
+    jl.partial_close("BTC/USDT:USDT", "long", 0.3, 1.0, 100300.0, reason="demo_partial")
+    jl.trade_close("BTC/USDT:USDT", "long", 50.0, 100250.0, 7.25, wins=3, losses=1, success_rate=0.75, reason="demo_close")
     jl.advisor(allow=True, confidence=0.82, note="trend intact")
     jl.warn("websocket hiccup", reconnect_in_sec=3)
     try:

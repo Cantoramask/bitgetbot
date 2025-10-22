@@ -41,3 +41,8 @@ class Settings:
     data_dir: str = os.getenv("DATA_DIR", "data")
     # optional risk caps
     max_notional_usdt: float = _float("RISK_MAX_NOTIONAL_DEFAULT", 2000.0)
+    # Item 1 context refresh
+    context_refresh_sec: int = _int("CONTEXT_REFRESH_SEC", 30)
+    # Item 10 partial take-profits
+    tp1_fraction: float = _float("TP1_FRACTION", 0.30)
+    tp2_fraction: float = _float("TP2_FRACTION", 0.30)
