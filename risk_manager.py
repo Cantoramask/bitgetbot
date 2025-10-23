@@ -272,8 +272,8 @@ class RiskManager:
             is_flip = self.state.last_side and self.state.last_side != side
         remain_flip = self._remaining(self.state.last_flip_ts, limits.flip_cooldown_sec, now) if is_flip else 0
         if is_flip and remain_flip > 0:
-            reasons.append(f"flip cooldown {remain_flip}s")
-            allowed = False
+            warnings.append(f"flip cooldown {remain_flip}s (allowed during active flip)")
+            # allow flips even during cooldown; do not block here
 
         info = {
             "symbol": symbol,

@@ -119,6 +119,8 @@ class Orchestrator:
         self._tp2_done = False
         self._initial_risk_abs = None  # price distance at entry for 1R
         self._entry_usdt = 0.0
+        self._last_flip_eval_ts = 0.0
+        self._flip_conf_min = float(os.getenv("TAKEOVER_FLIP_MIN_CONF", "0.60"))
 
     async def run(self):
         """Compatibility wrapper so the launcher can call orchestrator.run()."""
@@ -183,6 +185,70 @@ class Orchestrator:
                         size_usdt=self._position.size_usdt,
                         lev=self._position.leverage
                     )
+
+                    # --- Active takeover: if advisor disagrees, close & flip immediately (within risk limits) ---
+                    try:
+                        ctx = self._context_block()
+                        ctx["leverage"] = int(self.cfg.leverage)
+                        # Ask the advisor what side it wants now
+                        side_choice, reason, trail, decision = self.reasoner.decide(self.strategy, self._params, ctx)
+                        desired = side_choice if side_choice in ("long", "short") else "wait"
+                        conf = float(decision.get("confidence", 1.0))
+                        if desired != "wait" and desired != self._position.side and conf >= self._flip_conf_min:
+                            # Close existing first
+                            pnl = await self.adapter.close_position(asdict(self._position))
+                            self.risk.note_exit()
+                            if pnl is not None:
+                                if pnl < 0:
+                                    self._losses += 1
+                                    self.risk.register_fill(pnl_usdt=float(pnl or 0.0))
+                                else:
+                                    self._wins += 1
+                            self.jlog.trade_close(
+                                self.cfg.symbol, self._position.side,
+                                float(self._position.size_usdt),
+                                float(self._last_price or self._position.entry_price),
+                                float(pnl or 0.0),
+                                self._wins, self._losses, self._success_rate,
+                                reason="takeover_flip_close"
+                            )
+                            self._position = None
+                            # Risk-check the flip
+                            allowed, stake, info = self.risk.check_order(
+                                symbol=self.cfg.symbol,
+                                side=desired,
+                                requested_stake_usdt=float(self.cfg.stake_usdt),
+                                requested_leverage=int(self.cfg.leverage),
+                                vol_profile=self.cfg.vol_profile,
+                                now_ts=time.time(),
+                                is_flip=True,
+                            )
+                            if not allowed:
+                                self.jlog.warn("risk_block_flip", **info)
+                            else:
+                                opened = await self.adapter.place_order(side=desired, usdt=stake)
+                                if opened:
+                                    self._position = Position(**opened)  # type: ignore[arg-type]
+                                    self.risk.set_last_side(desired)
+                                    self.risk.note_flip()
+                                    # seed risk/TP bands
+                                    if self._last_price:
+                                        self._initial_risk_abs = float(self._last_price) * float(self._params.trail_pct_init)
+                                    else:
+                                        self._initial_risk_abs = None
+                                    self._entry_usdt = float(self._position.size_usdt)
+                                    self._tp1_done = False
+                                    self._tp2_done = False
+                                    self.jlog.trade_open(
+                                        self.cfg.symbol, desired,
+                                        float(self._entry_usdt), float(self._position.entry_price),
+                                        int(self._position.leverage),
+                                        reason="takeover_flip_open"
+                                    )
+                                else:
+                                    self.jlog.warn("open_failed_after_takeover_flip")
+                    except Exception as fe:
+                        self.jlog.exception(fe, where="takeover_active_flip")
                 else:
                     self.jlog.heartbeat(status="takeover_none")
             except Exception as e:
@@ -339,6 +405,71 @@ class Orchestrator:
                     pos = self._position
                     direction = 1 if pos.side == "long" else -1
                     change_abs = direction * (self._last_price - pos.entry_price)
+
+                    # Advisor-driven flip check (periodic) — do not wait for a big drawdown
+                    if (now - getattr(self, "_last_flip_eval_ts", 0.0)) >= max(3, self._params.intelligence_sec):
+                        try:
+                            ctx = self._context_block()
+                            ctx["leverage"] = int(self.cfg.leverage)
+                            side_choice, reason, trail, decision = self.reasoner.decide(self.strategy, self._params, ctx)
+                            desired = side_choice if side_choice in ("long", "short") else "wait"
+                            conf = float(decision.get("confidence", 1.0))
+                            if desired != "wait" and desired != pos.side and conf >= self._flip_conf_min:
+                                # Close current side
+                                pnl = await self.adapter.close_position(asdict(pos))
+                                self._position = None
+                                self._last_action_ts = time.time()
+                                self.risk.note_exit()
+                                if pnl is not None:
+                                    if pnl >= 0:
+                                        self._wins += 1
+                                    else:
+                                        self._losses += 1
+                                        self.risk.register_fill(pnl_usdt=float(pnl or 0.0))
+                                self.jlog.trade_close(
+                                    self.cfg.symbol, pos.side,
+                                    float(self._entry_usdt or pos.size_usdt),
+                                    float(self._last_price or pos.entry_price),
+                                    float(pnl or 0.0),
+                                    self._wins, self._losses, self._success_rate,
+                                    reason="advisor_flip_close"
+                                )
+                                # Risk-check and open desired side
+                                allowed, stake, info = self.risk.check_order(
+                                    symbol=self.cfg.symbol,
+                                    side=desired,
+                                    requested_stake_usdt=float(self.cfg.stake_usdt),
+                                    requested_leverage=int(self.cfg.leverage),
+                                    vol_profile=self.cfg.vol_profile,
+                                    now_ts=time.time(),
+                                    is_flip=True,
+                                )
+                                if not allowed:
+                                    self.jlog.warn("risk_block_flip", **info)
+                                else:
+                                    opened = await self.adapter.place_order(side=desired, usdt=stake)
+                                    if opened:
+                                        self._position = Position(**opened)  # type: ignore[arg-type]
+                                        self.risk.set_last_side(desired)
+                                        self.risk.note_flip()
+                                        if self._last_price:
+                                            self._initial_risk_abs = float(self._last_price) * float(self._params.trail_pct_init)
+                                        else:
+                                            self._initial_risk_abs = None
+                                        self._entry_usdt = float(self._position.size_usdt)
+                                        self._tp1_done = False
+                                        self._tp2_done = False
+                                        self.jlog.trade_open(
+                                            self.cfg.symbol, desired,
+                                            float(self._entry_usdt), float(self._position.entry_price),
+                                            int(self._position.leverage),
+                                            reason="advisor_flip_open"
+                                        )
+                                    else:
+                                        self.jlog.warn("open_failed_after_flip")
+                        except Exception as fe:
+                            self.jlog.exception(fe, where="advisor_flip_eval")
+                        self._last_flip_eval_ts = now
 
                     # Item 10: partial take-profits at 1R and 2R
                     if self._initial_risk_abs and self._initial_risk_abs > 0:
