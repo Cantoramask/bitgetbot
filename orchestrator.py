@@ -650,6 +650,33 @@ class Orchestrator:
             "last_action_ts": self._last_action_ts,
         }
 
+    def _save_state(self) -> None:
+        """
+        Persist a minimal run snapshot so the bot can resume safely after a restart.
+        Uses the small StateStore helper you already defined.
+        Never raises: logging-only on failure.
+        """
+        try:
+            snap = {
+                "ts": time.time(),
+                "symbol": self.cfg.symbol,
+                "live": bool(self.cfg.live),
+                "leverage": int(self.cfg.leverage),
+                "margin_mode": str(self.cfg.margin_mode),
+                "vol_profile": str(self.cfg.vol_profile),
+                "wins": int(self._wins),
+                "losses": int(self._losses),
+                "success_rate": float(self._success_rate),
+                "last_price": float(self._last_price) if self._last_price is not None else None,
+                "position": asdict(self._position) if self._position else None,
+                "params": asdict(self._params),
+            }
+            self.state_store.save(snap)
+        except Exception as e:
+            # Never let state saving crash the orchestrator
+            with contextlib.suppress(Exception):
+                self.jlog.warn("save_state_failed", error=str(e))
+
     def _context_block(self) -> Dict[str, Any]:
         ctx = self.feeder.context()
         return {
