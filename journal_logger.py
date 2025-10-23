@@ -57,8 +57,10 @@ class JournalLogger:
             raise TypeError("logger must be a logging.Logger")
         self.log = logger
         self.jsonl = jsonl or JsonlJournal("events")
-        # Minimal mode hides noisy advisory or tuning chatter
-        self.minimal = os.getenv("LOG_MINIMAL", "false").lower() in ("1", "true", "y", "yes")
+        # Minimal mode hides noisy advisory or tuning chatter.
+        # Default to quiet unless explicitly turned off.
+        self.minimal = os.getenv("LOG_MINIMAL", "true").lower() in ("1", "true", "y", "yes")
+
         # Throttle settings (seconds). You asked for ~30s unless an actual decision is made.
         try:
             self.hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "30")))
@@ -68,10 +70,15 @@ class JournalLogger:
             self.decide_interval = int(float(os.getenv("DECISION_INTERVAL_SEC", "30")))
         except Exception:
             self.decide_interval = 30
+
         # Internal timers and last-signatures for de-duplication
         self._last_hb_ts: float = 0.0
         self._last_decide_ts: float = 0.0
         self._last_decide_sig: Optional[str] = None
+
+        # New: throttle advisor spam the same way we do “wait” decisions
+        self._last_adv_ts: float = 0.0
+        self._last_adv_sig: Optional[str] = None
 
     # ------------
     # Low-level
@@ -119,19 +126,21 @@ class JournalLogger:
     def decision(self, side: str, reason: str, trail_pct: float, cautions: Optional[str] = None) -> None:
         if self.minimal:
             return
-        # Clean one-line note
+
         note = cautions
         if isinstance(note, str):
             note = " ".join(note.split())
             if len(note) > 300:
                 note = note[:300]
-        # Build signature to avoid repeating identical "wait" spam
-        sig = f"{side}|{reason}|{round(trail_pct,6)}|{note or ''}"
+
+        sig = f"{side}|{reason}|{round(trail_pct, 6)}|{note or ''}"
         now = time.time()
         is_wait = (side == "wait")
-        # Log immediately if it's not 'wait' (a real decision), or the signature changed; otherwise throttle.
+
+        # Quiet identical "wait" lines inside the interval.
         if is_wait and sig == self._last_decide_sig and (now - self._last_decide_ts) < max(1, self.decide_interval):
             return
+
         self._last_decide_sig = sig
         self._last_decide_ts = now
         msg = f"[DECIDE] side={side} trail={trail_pct:.4%} why={reason}" + (f" note={note}" if note else "")
@@ -171,10 +180,29 @@ class JournalLogger:
         self._write("info", msg, "partial_close", {"symbol": symbol, "side": side, "fraction": fraction, "r_mult": at_r, "price": price, "reason": reason})
 
     def advisor(self, allow: bool, confidence: float, note: Optional[str] = None) -> None:
+        # Quiet by default. If you need full advisor chatter, set LOG_MINIMAL=false.
         if self.minimal:
             return
+
+        # Build a signature that captures meaningfully different advisor outputs.
+        cleaned_note = None
+        if isinstance(note, str):
+            cleaned_note = " ".join(note.split())
+            if len(cleaned_note) > 300:
+                cleaned_note = cleaned_note[:300]
+
+        sig = f"{allow}|{round(confidence, 3)}|{cleaned_note or ''}"
+        now = time.time()
+
+        # Only emit if content changed or the interval elapsed.
+        if sig == self._last_adv_sig and (now - self._last_adv_ts) < max(1, self.decide_interval):
+            return
+
+        self._last_adv_sig = sig
+        self._last_adv_ts = now
+
         msg = f"[ADVISOR] allow={allow} conf={confidence:.2f}"
-        self._write("info", msg, "advisor", {"allow": allow, "confidence": confidence, "note": note})
+        self._write("info", msg, "advisor", {"allow": allow, "confidence": confidence, "note": cleaned_note})
 
     def warn(self, note: str, **fields: Any) -> None:
         msg = f"[WARN] {note}"
