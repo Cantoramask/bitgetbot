@@ -40,6 +40,8 @@ class Position:
     entry_price: float
     leverage: int
     contracts: float
+    # NEW: accept raw exchange order payload so Position(**raw) never crashes
+    order: Optional[dict] = None
 
 @dataclass
 class Params:
