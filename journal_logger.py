@@ -61,15 +61,15 @@ class JournalLogger:
         # Default to quiet unless explicitly turned off.
         self.minimal = os.getenv("LOG_MINIMAL", "true").lower() in ("1", "true", "y", "yes")
 
-        # Throttle settings (seconds). You asked for ~30s unless an actual decision is made.
+        # Throttle settings (seconds). You asked for ~20s unless an actual decision is made.
         try:
-            self.hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "30")))
+            self.hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "20")))
         except Exception:
-            self.hb_interval = 30
+            self.hb_interval = 20
         try:
-            self.decide_interval = int(float(os.getenv("DECISION_INTERVAL_SEC", "30")))
+            self.decide_interval = int(float(os.getenv("DECISION_INTERVAL_SEC", "20")))
         except Exception:
-            self.decide_interval = 30
+            self.decide_interval = 20
 
         # Internal timers and last-signatures for de-duplication
         self._last_hb_ts: float = 0.0
@@ -124,21 +124,29 @@ class JournalLogger:
         self._write("info", msg, "heartbeat", fields)
 
     def decision(self, side: str, reason: str, trail_pct: float, cautions: Optional[str] = None) -> None:
+        # Minimal mode hides decision chatter entirely.
         if self.minimal:
             return
 
+        # Keep the note short and one line for humans.
         note = cautions
         if isinstance(note, str):
             note = " ".join(note.split())
             if len(note) > 300:
                 note = note[:300]
 
+        # Signature is still useful when side is not "wait".
         sig = f"{side}|{reason}|{round(trail_pct, 6)}|{note or ''}"
         now = time.time()
         is_wait = (side == "wait")
 
-        # Quiet identical "wait" lines inside the interval.
-        if is_wait and sig == self._last_decide_sig and (now - self._last_decide_ts) < max(1, self.decide_interval):
+        # Hard time-based throttle for "wait" to stop console spam regardless of content changes.
+        # If it's been less than decide_interval since the last decision line, suppress it.
+        if is_wait and (now - self._last_decide_ts) < max(1, self.decide_interval):
+            return
+
+        # For non-wait decisions, still suppress exact duplicates within the interval.
+        if (not is_wait) and sig == self._last_decide_sig and (now - self._last_decide_ts) < max(1, self.decide_interval):
             return
 
         self._last_decide_sig = sig

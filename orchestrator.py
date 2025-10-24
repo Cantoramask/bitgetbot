@@ -575,6 +575,8 @@ class Orchestrator:
 
     async def _heartbeat(self):
         try:
+            # Use the same interval as JournalLogger by reading the env, default 20s.
+            hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "20")))
             while not self._stop.is_set():
                 st = self._snapshot()
                 ctx = self._context_block()
@@ -584,7 +586,7 @@ class Orchestrator:
                     "volatility": ctx.get("volatility"),
                 })
                 self.jlog.heartbeat(**st)
-                await asyncio.sleep(30)
+                await asyncio.sleep(max(1, hb_interval))
         except asyncio.CancelledError:
             raise
         except Exception as e:
