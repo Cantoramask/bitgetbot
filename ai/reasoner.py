@@ -97,7 +97,6 @@ class Reasoner:
                     if isinstance(out, dict):
                         side = str(out.get("side", "wait")) or "wait"
                         reason = str(out.get("reason", "strategy_decide")) or "strategy_decide"
-                        # trail_pct is optional from strategy; the orchestrator still scales its own trails
                         if out.get("trail_pct") is not None:
                             try:
                                 trail_from_strategy = float(out["trail_pct"])
@@ -148,7 +147,15 @@ class Reasoner:
         }
         allow, confidence, note = self.evaluate(snap)
 
-        # Hard block only if advisor is very unsure (<0.30) or explicitly says it cannot manage
+        # New: honour allow == False as a hard block
+        if not allow:
+            side = "wait"
+            reason = "advisor_block"
+            decision = {"allow": False, "confidence": float(confidence), "note": note}
+            use_trail = params.trail_pct_init if trail_from_strategy is None else float(trail_from_strategy)
+            return side, reason, float(use_trail), decision
+
+        # Existing hard block on very low confidence or explicit can't-manage phrasing
         txt = (note or "").lower()
         says_cant_manage = any(k in txt for k in ("cannot manage", "can't manage", "unmanageable", "do not trade", "do not proceed"))
         hard_block = (confidence < 0.30) or says_cant_manage
@@ -156,7 +163,8 @@ class Reasoner:
             side = "wait"
             reason = "advisor_block"
             decision = {"allow": False, "confidence": float(confidence), "note": note}
-            return side, reason, float(params.trail_pct_init if trail_from_strategy is None else trail_from_strategy), decision
+            use_trail = params.trail_pct_init if trail_from_strategy is None else float(trail_from_strategy)
+            return side, reason, float(use_trail), decision
 
         # Warn-but-allow band: 0.30 <= confidence < 0.70
         if confidence < 0.70:

@@ -542,9 +542,9 @@ class Orchestrator:
                         await asyncio.sleep(0.5)
                         continue
 
-                    # Normal trailing exit
+                    # Normal trailing exit: directional instead of absolute
                     trigger = self._params.trail_pct_tight * 0.5
-                    if abs(change_pct) >= trigger:
+                    if change_pct <= -trigger:
                         pnl = await self.adapter.close_position(asdict(pos))
                         self._position = None
                         self._last_action_ts = time.time()
