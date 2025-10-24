@@ -28,7 +28,6 @@ from typing import Optional, Dict, Any
 from config.settings import Settings
 from exchange.adapter import BitgetAdapter
 from data.feeder import DataFeeder  # unified feeder
-# from strategies.trend import TrendStrategy  # keep if present in your repo
 from journal_logger import JournalLogger
 from ai.reasoner import Reasoner
 from risk_manager import RiskManager, RiskLimits
@@ -59,11 +58,11 @@ class Orchestrator:
         self.cfg = cfg
         self.logger = logger
 
-        self.jlog = JournalLogger(self.logger)  # fixed constructor usage
+        self.jlog = JournalLogger(self.logger)
         self.state_store = StateStore("runtime_store/position_state.json")
 
         self.risk = RiskManager(self.logger, RiskLimits(
-            max_stake_usdt=self.cfg.max_notional_usdt,  # starting point; will be trimmed by notional fence
+            max_stake_usdt=self.cfg.max_notional_usdt,
             max_daily_loss_usdt=300.0,
             reopen_cooldown_sec=10,
             loss_cooldown_sec=300,
@@ -79,16 +78,16 @@ class Orchestrator:
             live=self.cfg.live,
         )
 
-        # Unified feeder: prices plus context snapshot for item 1
-        self.feeder = DataFeeder(self.adapter, window=1200, poll_sec=1.0)
-
-        # Strategy is optional here; Reasoner will handle absence gracefully
+        # Strategy: construct correctly without passing a logger
         self.strategy = None
         try:
             from strategies.trend import TrendStrategy  # type: ignore
-            self.strategy = TrendStrategy(self.logger)
+            self.strategy = TrendStrategy()
         except Exception:
             self.strategy = None
+
+        # Unified feeder: prices plus context snapshot for item 1
+        self.feeder = DataFeeder(self.adapter, window=1200, poll_sec=1.0)
 
         self.reasoner = Reasoner()
 
@@ -117,7 +116,7 @@ class Orchestrator:
         # Item 10 state for partial take profits
         self._tp1_done = False
         self._tp2_done = False
-        self._initial_risk_abs = None  # price distance at entry for 1R
+        self._initial_risk_abs = None
         self._entry_usdt = 0.0
         self._last_flip_eval_ts = 0.0
         self._flip_conf_min = float(os.getenv("TAKEOVER_FLIP_MIN_CONF", "0.60"))
@@ -148,7 +147,6 @@ class Orchestrator:
                 if raw and raw.get("symbol") == self.adapter.symbol:
                     self._position = Position(**raw)  # type: ignore[arg-type]
 
-                    # Align leverage to live position
                     try:
                         self.cfg.leverage = int(self._position.leverage)
                     except Exception:
@@ -163,7 +161,6 @@ class Orchestrator:
 
                     self.risk.set_last_side(self._position.side)
 
-                    # Log an explicit "actual" config snapshot reflecting the live position
                     try:
                         actual_notional = float(self._position.size_usdt)
                     except Exception:
@@ -186,16 +183,14 @@ class Orchestrator:
                         lev=self._position.leverage
                     )
 
-                    # --- Active takeover: if advisor disagrees, close & flip immediately (within risk limits) ---
+                    # Optional immediate flip on takeover if advisor strongly disagrees
                     try:
                         ctx = self._context_block()
                         ctx["leverage"] = int(self.cfg.leverage)
-                        # Ask the advisor what side it wants now
                         side_choice, reason, trail, decision = self.reasoner.decide(self.strategy, self._params, ctx)
                         desired = side_choice if side_choice in ("long", "short") else "wait"
                         conf = float(decision.get("confidence", 1.0))
                         if desired != "wait" and desired != self._position.side and conf >= self._flip_conf_min:
-                            # Close existing first
                             pnl = await self.adapter.close_position(asdict(self._position))
                             self.risk.note_exit()
                             if pnl is not None:
@@ -213,7 +208,6 @@ class Orchestrator:
                                 reason="takeover_flip_close"
                             )
                             self._position = None
-                            # Risk-check the flip
                             allowed, stake, info = self.risk.check_order(
                                 symbol=self.cfg.symbol,
                                 side=desired,
@@ -231,7 +225,6 @@ class Orchestrator:
                                     self._position = Position(**opened)  # type: ignore[arg-type]
                                     self.risk.set_last_side(desired)
                                     self.risk.note_flip()
-                                    # seed risk/TP bands
                                     if self._last_price:
                                         self._initial_risk_abs = float(self._last_price) * float(self._params.trail_pct_init)
                                     else:
@@ -295,9 +288,8 @@ class Orchestrator:
             while not self._stop.is_set():
                 self._last_price = self.feeder.last_price()
                 if self._last_price is not None and self.strategy is not None:
-                    # let strategy update if present
                     try:
-                        self.strategy.update_tick(self._last_price)  # type: ignore[attr-defined]
+                        self.strategy.update_tick(self._last_price)  # updates SMA buffers
                     except Exception:
                         pass
                 await asyncio.sleep(0.5)
@@ -338,7 +330,6 @@ class Orchestrator:
                         await asyncio.sleep(0.8)
                         continue
 
-                    # Item 2: use confidence to scale stake and trail
                     confidence = float(decision.get("confidence", 1.0))
                     conf_effect = self._clamp(confidence, 0.5, 1.0)
                     scaled_stake = float(self.cfg.stake_usdt) * conf_effect
@@ -384,7 +375,6 @@ class Orchestrator:
                     self._position = Position(**raw)  # type: ignore[arg-type]
                     self._last_action_ts = now
                     self.risk.set_last_side(side_choice)
-                    # Item 10: compute initial risk in price terms using scaled_trail_init
                     if self._last_price:
                         self._initial_risk_abs = float(self._last_price) * float(scaled_trail_init)
                     else:
@@ -406,7 +396,7 @@ class Orchestrator:
                     direction = 1 if pos.side == "long" else -1
                     change_abs = direction * (self._last_price - pos.entry_price)
 
-                    # Advisor-driven flip check (periodic) — do not wait for a big drawdown
+                    # Advisor-driven flip check (periodic)
                     if (now - getattr(self, "_last_flip_eval_ts", 0.0)) >= max(3, self._params.intelligence_sec):
                         try:
                             ctx = self._context_block()
@@ -415,7 +405,6 @@ class Orchestrator:
                             desired = side_choice if side_choice in ("long", "short") else "wait"
                             conf = float(decision.get("confidence", 1.0))
                             if desired != "wait" and desired != pos.side and conf >= self._flip_conf_min:
-                                # Close current side
                                 pnl = await self.adapter.close_position(asdict(pos))
                                 self._position = None
                                 self._last_action_ts = time.time()
@@ -434,7 +423,6 @@ class Orchestrator:
                                     self._wins, self._losses, self._success_rate,
                                     reason="advisor_flip_close"
                                 )
-                                # Risk-check and open desired side
                                 allowed, stake, info = self.risk.check_order(
                                     symbol=self.cfg.symbol,
                                     side=desired,
@@ -477,7 +465,6 @@ class Orchestrator:
                             ok = await self.adapter.close_position_fraction(asdict(pos), fraction=float(os.getenv("TP1_FRACTION", "0.30")))
                             if ok:
                                 self._tp1_done = True
-                                # shrink local position contracts and usdt if adapter returned updated size
                                 newp = await self.adapter.get_open_position(self.adapter.symbol)
                                 if newp:
                                     self._position = Position(**newp)  # type: ignore[arg-type]
@@ -491,15 +478,12 @@ class Orchestrator:
                                     self._position = Position(**newp)  # type: ignore[arg-type]
                                 self.jlog.partial_close(self.cfg.symbol, pos.side, fraction=float(os.getenv("TP2_FRACTION", "0.30")), at_r=2.0, price=float(self._last_price), reason="partial_close_2R")
 
-                   # Emergency exit: protects very high leverage positions
-                    direction = 1 if pos.side == "long" else -1
-                    # correct denom so percent change is relative to entry price (works for small-priced coins)
+                    # Emergency exit
                     denom = pos.entry_price if (pos.entry_price and pos.entry_price > 0) else 1e-9
                     change_pct = direction * (self._last_price - pos.entry_price) / denom
-                    emergency_trigger = max(0.003, 0.03 / max(1, int(pos.leverage)))  # 0.3% floor; scales with lev
+                    emergency_trigger = max(0.003, 0.03 / max(1, int(pos.leverage)))
 
                     if change_pct <= -emergency_trigger:
-                        # Try to FLIP first (only if advisor confidence says it can manage)
                         flip_side = "short" if pos.side == "long" else "long"
                         snap = {
                             "side": flip_side,
@@ -513,7 +497,6 @@ class Orchestrator:
                         }
                         allow, conf, note = self.reasoner.evaluate(snap)
 
-                        # Always CLOSE to stop the bleed; then optionally flip if advisor says it can manage (conf ≥ 0.60)
                         pnl = await self.adapter.close_position(asdict(pos))
                         self._position = None
                         self._last_action_ts = time.time()
@@ -530,16 +513,13 @@ class Orchestrator:
                         )
                         self._save_state()
 
-                        # Flip only if advisor is comfortable enough to manage it
                         if allow and float(conf) >= 0.60:
                             try:
-                                # size: keep it sane under risk limits
                                 stake_for_flip = min(float(self.cfg.stake_usdt), self.risk.limits.max_stake_usdt)
                                 opened = await self.adapter.place_order(side=flip_side, usdt=stake_for_flip)
                                 if opened:
                                     self._position = Position(**opened)  # type: ignore[arg-type]
                                     self.risk.set_last_side(flip_side)
-                                    # re-seed initial risk band for partial TPs
                                     if self._last_price:
                                         self._initial_risk_abs = float(self._last_price) * float(self._params.trail_pct_init)
                                     else:
@@ -557,14 +537,10 @@ class Orchestrator:
                                     self.jlog.warn("open_failed_after_flip")
                             except Exception as fe:
                                 self.jlog.exception(fe, where="flip_after_emergency")
-                        else:
-                            # no flip — advisor isn’t confident; stay flat
-                            pass
-
                         await asyncio.sleep(0.5)
                         continue
 
-                    # Normal trailing exit using tight trail as a simple proxy
+                    # Normal trailing exit
                     trigger = self._params.trail_pct_tight * 0.5
                     if abs(change_pct) >= trigger:
                         pnl = await self.adapter.close_position(asdict(pos))
@@ -599,7 +575,6 @@ class Orchestrator:
         try:
             while not self._stop.is_set():
                 st = self._snapshot()
-                # include context awareness into heartbeat for item 1
                 ctx = self._context_block()
                 st.update({
                     "funding": ctx.get("funding"),
@@ -624,14 +599,12 @@ class Orchestrator:
             self.jlog.exception(e, where="regime")
 
     async def _infer_vol_profile(self, force: bool):
-        # simple placeholder
         try:
             pass
         except Exception as e:
             self.jlog.exception(e, where="infer_vol")
 
     def _auto_tune_params(self):
-        # simple placeholder
         pass
 
     def _snapshot(self) -> Dict[str, Any]:
@@ -651,11 +624,6 @@ class Orchestrator:
         }
 
     def _save_state(self) -> None:
-        """
-        Persist a minimal run snapshot so the bot can resume safely after a restart.
-        Uses the small StateStore helper you already defined.
-        Never raises: logging-only on failure.
-        """
         try:
             snap = {
                 "ts": time.time(),
@@ -673,7 +641,6 @@ class Orchestrator:
             }
             self.state_store.save(snap)
         except Exception as e:
-            # Never let state saving crash the orchestrator
             with contextlib.suppress(Exception):
                 self.jlog.warn("save_state_failed", error=str(e))
 
