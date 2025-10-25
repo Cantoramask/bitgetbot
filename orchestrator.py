@@ -111,6 +111,16 @@ class Orchestrator:
         self._big_loss_abs = float(os.getenv("BIG_LOSS_USDT", "0"))      # hard USD floor (optional)
         self._consec_loss_limit = int(float(os.getenv("CONSEC_LOSS_LIMIT", "3")))
 
+        # Profit-aligned flip gating (no timers)
+        self._flip_min_conf = float(os.getenv("FLIP_MIN_CONF", "0.65"))          # min advisor confidence to even consider flip
+        self._flip_stability_N = int(os.getenv("FLIP_STABILITY_N", "3"))         # consecutive opposite signals required
+        self._flip_min_move_pct = float(os.getenv("FLIP_MIN_MOVE_PCT", "0.0015"))# 0.15% min move from entry to consider flip
+        self._tx_cost_bps = float(os.getenv("TX_COST_BPS", "6.0"))               # fees+slippage in basis points (0.06%)
+        self._edge_buffer_bps = float(os.getenv("EDGE_BUFFER_BPS", "4.0"))       # extra edge above cost to justify flip
+
+        # running vote for stability
+        self._flip_vote = {"side": None, "count": 0, "last_ts": 0.0}
+
         # Dynamic parameters; AI auto-tunes these
         self._params = Params(
             trail_pct_init=0.003,      # 0.3%
@@ -361,7 +371,7 @@ class Orchestrator:
                     direction = 1 if pos.side == "long" else -1
                     change_abs = direction * (self._last_price - pos.entry_price)
 
-                    # Advisor-driven flip check (periodic) — pre-check risk BEFORE closing.
+                    # Advisor-driven flip check (periodic) — only flip if economically justified.
                     if (now >= float(self._takeover_grace_until)) and (
                         (now - getattr(self, "_last_flip_eval_ts", 0.0)) >= max(3, self._params.intelligence_sec)
                     ):
@@ -372,8 +382,10 @@ class Orchestrator:
                             desired = side_choice if side_choice in ("long", "short") else "wait"
                             conf = float(decision.get("confidence", 1.0))
 
-                            if desired != "wait" and desired != pos.side and conf >= self._flip_conf_min:
-                                # Pre-check risk for the flip target BEFORE closing current.
+                            do_flip, why = self._should_flip(pos, desired, conf, ctx) if desired != "wait" else (False, "advisor_wait")
+
+                            if do_flip:
+                                # Pre-check risk BEFORE closing.
                                 allowed, stake, info = self.risk.check_order(
                                     symbol=self.cfg.symbol,
                                     side=desired,
@@ -385,10 +397,9 @@ class Orchestrator:
                                     confidence=conf,
                                 )
                                 if not allowed:
-                                    # Do NOT close if we won't be allowed to open.
-                                    self.jlog.warn("risk_block_flip", **info)
+                                    self.jlog.warn("risk_block_flip", gate="pre", why=why, **info)
                                 else:
-                                    # Now we’re allowed: close then open the new side.
+                                    # Close current
                                     pnl = await self.adapter.close_position(asdict(pos))
                                     self._position = None
                                     self._last_action_ts = time.time()
@@ -404,11 +415,15 @@ class Orchestrator:
                                         reason="advisor_flip_close"
                                     )
 
+                                    # Open new side
                                     opened = await self.adapter.place_order(side=desired, usdt=stake)
                                     if opened:
                                         self._position = Position(**opened)  # type: ignore[arg-type]
-                                        self.risk.set_last_side(desired)
-                                        self.risk.note_flip()
+                                        try:
+                                            self.risk.set_last_side(desired)
+                                            self.risk.note_flip()
+                                        except Exception:
+                                            pass
                                         if self._last_price:
                                             self._initial_risk_abs = float(self._last_price) * float(self._params.trail_pct_init)
                                         else:
@@ -423,7 +438,29 @@ class Orchestrator:
                                             reason="advisor_flip_open"
                                         )
                                     else:
-                                        self.jlog.warn("open_failed_after_flip")
+                                        self.jlog.warn("open_failed_after_flip", why=why)
+                            else:
+                                # Prefer flat over flip when edge is tiny and PnL is around costs
+                                denom = pos.entry_price if pos.entry_price else 1e-9
+                                change_pct_signed = (1 if pos.side == "long" else -1) * (self._last_price - pos.entry_price) / denom
+                                change_bps = 10000.0 * change_pct_signed
+                                if abs(change_bps) <= (self._tx_cost_bps * 1.2):
+                                    pnl = await self.adapter.close_position(asdict(pos))
+                                    self._position = None
+                                    self._last_action_ts = time.time()
+                                    self.risk.note_exit()
+                                    self._note_trade_result(pnl)
+
+                                    self.jlog.trade_close(
+                                        self.cfg.symbol, pos.side,
+                                        float(self._entry_usdt or pos.size_usdt),
+                                        float(self._last_price or pos.entry_price),
+                                        float(pnl or 0.0),
+                                        self._wins, self._losses, self._success_rate,
+                                        reason="advisor_flat_small_edge"
+                                    )
+                                else:
+                                    self.jlog.decision("hold", "flip_gated", trail, cautions=why)
                         except Exception as fe:
                             self.jlog.exception(fe, where="advisor_flip_eval")
                         self._last_flip_eval_ts = now
@@ -651,7 +688,59 @@ class Orchestrator:
             except Exception:
                 pass
 
+    def _estimate_edge_bps(self, conf: float, ctx: Dict[str, Any]) -> float:
+        """
+        Rough edge proxy in basis points.
+        - Use advisor confidence above 0.5 as a multiplier of recent realized volatility snapshot (pct).
+        - If no volatility available, fall back to a fixed tiny baseline.
+        """
+        vol_pct = float(ctx.get("volatility") or 0.002)  # 0.2% fallback
+        conf_excess = max(0.0, conf - 0.5) / 0.5  # 0..1 when conf in [0.5,1]
+        edge_pct = conf_excess * vol_pct                     # % move we expect to capture
+        return 10000.0 * edge_pct                            # convert % to bps
+
+    def _update_flip_vote(self, desired_side: str) -> int:
+        now = time.time()
+        if desired_side and self._flip_vote["side"] == desired_side:
+            self._flip_vote["count"] += 1
+        else:
+            self._flip_vote = {"side": desired_side, "count": 1, "last_ts": now}
+        self._flip_vote["last_ts"] = now
+        return self._flip_vote["count"]
+
+    def _should_flip(self, pos: "Position", desired: str, conf: float, ctx: Dict[str, Any]) -> (bool, str):
+        """
+        Decide if flipping is economically justified (profit-aligned).
+        Returns (ok, reason).
+        """
+        if desired not in ("long", "short") or desired == pos.side:
+            return (False, "same_or_invalid_side")
+
+        # 1) confidence gate
+        if conf < self._flip_min_conf:
+            return (False, f"conf<{self._flip_min_conf}")
+
+        # 2) stability gate (consecutive opposite recommendations)
+        votes = self._update_flip_vote(desired)
+        if votes < self._flip_stability_N:
+            return (False, f"stability<{self._flip_stability_N} (votes={votes})")
+
+        # 3) no-churn zone around entry
+        denom = pos.entry_price if pos.entry_price else 1e-9
+        move_from_entry_pct = abs((self._last_price - pos.entry_price) / denom)
+        if move_from_entry_pct < self._flip_min_move_pct:
+            return (False, f"move<{self._flip_min_move_pct*100:.2f}%")
+
+        # 4) edge > cost + buffer
+        edge_bps = self._estimate_edge_bps(conf, ctx)
+        needed_bps = self._tx_cost_bps + self._edge_buffer_bps
+        if edge_bps < needed_bps:
+            return (False, f"edge_bps<{needed_bps} (edge={edge_bps:.1f})")
+
+        return (True, f"ok edge={edge_bps:.1f}bps votes={votes}")
+
     # -------------------------
+    # NEW: atomic close & state refresh helpers
 
 class StateStore:
     def __init__(self, path: str):
