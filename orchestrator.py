@@ -584,6 +584,13 @@ class Orchestrator:
             while not self._stop.is_set():
                 st = self._snapshot() or {}
                 ctx = self._context_block() or {}
+                # normalise nested dicts so downstream .get() calls never hit None
+                if st.get("params") is None:
+                    st["params"] = {}
+                if st.get("position") is None:
+                    st["position"] = {}
+                if st.get("decision") is None:
+                    st["decision"] = {}
                 st.update({
                     "funding": ctx.get("funding"),
                     "open_interest": ctx.get("open_interest"),
