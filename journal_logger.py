@@ -61,11 +61,11 @@ class JournalLogger:
         # Default to quiet unless explicitly turned off.
         self.minimal = os.getenv("LOG_MINIMAL", "true").lower() in ("1", "true", "y", "yes")
 
-        # Throttle settings (seconds). You asked for ~20s unless an actual decision is made.
+        # Throttle settings (seconds). You asked for ~30s unless an actual decision or major change is made.
         try:
-            self.hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "20")))
+            self.hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "30")))
         except Exception:
-            self.hb_interval = 20
+            self.hb_interval = 30
         try:
             self.decide_interval = int(float(os.getenv("DECISION_INTERVAL_SEC", "20")))
         except Exception:
@@ -79,6 +79,9 @@ class JournalLogger:
         # New: throttle advisor spam the same way we do “wait” decisions
         self._last_adv_ts: float = 0.0
         self._last_adv_sig: Optional[str] = None
+
+        # New: remember last heartbeat’s important fields to force-print on major change
+        self._last_hb_sig: Optional[str] = None
 
     # ------------
     # Low-level
@@ -112,16 +115,79 @@ class JournalLogger:
         self._write("info", msg, "shutdown", {})
 
     def heartbeat(self, **fields: Any) -> None:
-        # Throttle heartbeats to every hb_interval seconds unless it's a notable status.
-        notable = str(fields.get("status", "")).lower() in {
-            "open", "close", "takeover", "emergency_exit", "trail_exit", "partial_close", "open_failed", "open_failed_after_flip"
-        }
+        """
+        Emit a short one-line heartbeat every hb_interval seconds,
+        or immediately if there is a major change in key fields.
+
+        Major changes we consider:
+          - wins or losses changed
+          - position side/symbol changed or went from none->open/close
+          - takeover flag changed
+          - status changed (e.g., open, close, takeover, emergency_exit)
+          - leverage changed
+        """
+        # Extract useful fields with safe defaults
+        symbol = str(fields.get("symbol") or fields.get("sym") or fields.get("pos_symbol") or fields.get("instrument") or "").strip() or str(fields.get("position", {}).get("symbol", ""))
+        pos = fields.get("position")
+        side = None
+        lev = None
+        if isinstance(pos, dict):
+            side = pos.get("side")
+            lev = pos.get("leverage")
+            if not symbol:
+                symbol = pos.get("symbol", "")
+        side = str(fields.get("side", side) or "none")
+        try:
+            lev = int(fields.get("leverage", lev) or 0)
+        except Exception:
+            lev = 0
+        price = fields.get("last_price") or fields.get("price") or fields.get("mark") or fields.get("index")
+        try:
+            price_f = float(price) if price is not None else None
+        except Exception:
+            price_f = None
+        wins = int(fields.get("wins") or 0)
+        losses = int(fields.get("losses") or 0)
+        sr = fields.get("success_rate")
+        try:
+            sr_f = float(sr) if sr is not None else None
+        except Exception:
+            sr_f = None
+        takeover = fields.get("takeover")
+        status = str(fields.get("status") or ("takeover" if takeover else "")).strip() or "idle"
+
+        # Build short human line
+        price_part = f" @ {price_f:.6f}" if isinstance(price_f, float) else ""
+        sr_part = f" sr={sr_f:.2f}" if isinstance(sr_f, float) else ""
+        lev_part = f" x{lev}" if lev else ""
+        takeover_part = f" takeover={bool(takeover)}" if takeover is not None else ""
+        pos_side = side if side != "none" else (pos.get("side") if isinstance(pos, dict) else "none")
+        hb_msg = f"[HB] {symbol or '-'} {pos_side} {lev_part}{price_part}{sr_part} W{wins}/L{losses}{takeover_part} status={status}"
+
+        # Decide if this is a notable heartbeat
         now = time.time()
-        if not notable and (now - self._last_hb_ts) < max(1, self.hb_interval):
+
+        # Compute signature of important fields to detect major changes
+        sig = "|".join([
+            symbol or "-",
+            str(pos_side),
+            str(lev or 0),
+            str(wins),
+            str(losses),
+            str(bool(takeover)),
+            status,
+        ])
+
+        major_change = (self._last_hb_sig is None) or (sig != self._last_hb_sig)
+
+        # Allow immediate print if major change, else throttle by interval
+        if not major_change and (now - self._last_hb_ts) < max(1, self.hb_interval):
             return
+
+        # Update trackers and emit
+        self._last_hb_sig = sig
         self._last_hb_ts = now
-        msg = "[HB] " + " ".join(f"{k}={fields[k]}" for k in sorted(fields))
-        self._write("info", msg, "heartbeat", fields)
+        self._write("info", hb_msg, "heartbeat", fields)
 
     def decision(self, side: str, reason: str, trail_pct: float, cautions: Optional[str] = None) -> None:
         # Minimal mode hides decision chatter entirely.
@@ -243,7 +309,7 @@ if __name__ == "__main__":
     jl = JournalLogger(pylog, JsonlJournal("events"))
 
     jl.startup({"symbol": "BTC/USDT:USDT", "lev": 5, "live": False})
-    jl.heartbeat(price=100123.45, pos="none", intel_sec=10, trail_init=0.008, trail_tight=0.004)
+    jl.heartbeat(price=100123.45, pos="none", intel_sec=10, trail_init=0.008, trail_tight=0.004, wins=0, losses=0, success_rate=0.75, symbol="BTC/USDT:USDT", side="none", leverage=5, takeover=False, status="idle")
     jl.decision(side="long", reason="trend up, pullback to MA", trail_pct=0.008)
     jl.knob_change("intelligence_sec", 10, 15, "volatility high")
     jl.trade_open("BTC/USDT:USDT", "long", 50.0, 100100.0, 5, reason="demo_open")
