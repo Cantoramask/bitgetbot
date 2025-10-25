@@ -315,7 +315,7 @@ async def _async_main():
     if takeover:
         # Skip ALL further prompts; use env/defaults and the detected symbol
         symbol_in = chosen_symbol or default_symbol
-        live_in = default_live_env
+        live_in = True
         stake_in = default_stake
         lev_in = default_lev
         margin_in = default_margin
