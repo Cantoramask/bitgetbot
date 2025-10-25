@@ -107,7 +107,7 @@ class Orchestrator:
             trail_pct_init=0.003,      # 0.3 percent
             trail_pct_tight=0.002,     # 0.2 percent
             atr_len=5,
-            intelligence_sec=self.cfg.intelligence_check_sec,
+            intelligence_sec=max(8, int(self.cfg.intelligence_check_sec)),  # <= raised floor
             reopen_cooldown_sec=10,
             min_trail_init=0.002,
             max_trail_init=0.01,
@@ -122,6 +122,9 @@ class Orchestrator:
         self._entry_usdt = 0.0
         self._last_flip_eval_ts = 0.0
         self._flip_conf_min = float(os.getenv("TAKEOVER_FLIP_MIN_CONF", "0.60"))
+        # Grace window after takeover to suppress immediate flips/forced closes
+        self._takeover_grace_sec = int(float(os.getenv("TAKEOVER_GRACE_SEC", "60")))
+        self._takeover_grace_until = 0.0
 
     async def run(self):
         """Compatibility wrapper so the launcher can call orchestrator.run()."""
@@ -146,20 +149,11 @@ class Orchestrator:
         if getattr(self.cfg, "takeover", False):
             try:
                 raw = await self.adapter.get_open_position(self.adapter.symbol)
-                if raw and raw.get("symbol") == self.adapter.symbol:
+                if raw and raw.get("symbol") == self.adapter.symbol:  # <-- preceding line (exists)
                     self._position = Position(**raw)  # type: ignore[arg-type]
-
-                    try:
-                        self.cfg.leverage = int(self._position.leverage)
-                    except Exception:
-                        pass
-                    self.adapter.leverage = int(self.cfg.leverage)
-
-                    if self.adapter.live:
-                        try:
-                            await asyncio.to_thread(self.adapter.ex.set_leverage, self.adapter.leverage, self.adapter.symbol)
-                        except Exception as se:
-                            self.jlog.warn("set_leverage_warn", error=str(se))
+                    # Do NOT modify or reapply leverage on takeover; keep exchange position as-is.
+                    # Start a grace window to suppress flips/forced closes immediately after takeover.
+                    self._takeover_grace_until = time.time() + float(self._takeover_grace_sec)
 
                     self.risk.set_last_side(self._position.side)
 
@@ -173,7 +167,7 @@ class Orchestrator:
                         ep = 0.0
 
                     self.logger.info(
-                        f"[CFG-ACTUAL] symbol={self.adapter.symbol} stake=existing lev={self.cfg.leverage} "
+                        f"[CFG-ACTUAL] symbol={self.adapter.symbol} stake=existing lev={self._position.leverage} "
                         f"live={self.adapter.live} margin={self.adapter.margin_mode} "
                         f"position_side={self._position.side} entry_price={ep} size_usdt={actual_notional:.6f} takeover=True"
                     )
@@ -185,68 +179,13 @@ class Orchestrator:
                         lev=self._position.leverage
                     )
 
-                    # Optional immediate flip on takeover if advisor strongly disagrees
+                    # No immediate flip on takeover; wait for grace window to expire.
                     try:
-                        ctx = self._context_block()
-                        ctx["leverage"] = int(self.cfg.leverage)
-                        side_choice, reason, trail, decision = self.reasoner.decide(self.strategy, self._params, ctx)
-                        desired = side_choice if side_choice in ("long", "short") else "wait"
-                        conf = float(decision.get("confidence", 1.0))
-                        if desired != "wait" and desired != self._position.side and conf >= self._flip_conf_min:
-                            pnl = await self.adapter.close_position(asdict(self._position))
-                            self.risk.note_exit()
-                            if pnl is not None:
-                                if pnl < 0:
-                                    self._losses += 1
-                                    self.risk.register_fill(pnl_usdt=float(pnl or 0.0))
-                                else:
-                                    self._wins += 1
-                            self.jlog.trade_close(
-                                self.cfg.symbol, self._position.side,
-                                float(self._position.size_usdt),
-                                float(self._last_price or self._position.entry_price),
-                                float(pnl or 0.0),
-                                self._wins, self._losses, self._success_rate,
-                                reason="takeover_flip_close"
-                            )
-                            self._position = None
-                            allowed, stake, info = self.risk.check_order(
-                                symbol=self.cfg.symbol,
-                                side=desired,
-                                requested_stake_usdt=float(self.cfg.stake_usdt),
-                                requested_leverage=int(self.cfg.leverage),
-                                vol_profile=self.cfg.vol_profile,
-                                now_ts=time.time(),
-                                is_flip=True,
-                                confidence=conf,
-                            )
-                            if not allowed:
-                                self.jlog.warn("risk_block_flip", **info)
-                            else:
-                                opened = await self.adapter.place_order(side=desired, usdt=stake)
-                                if opened:
-                                    self._position = Position(**opened)  # type: ignore[arg-type]
-                                    self.risk.set_last_side(desired)
-                                    self.risk.note_flip()
-                                    if self._last_price:
-                                        self._initial_risk_abs = float(self._last_price) * float(self._params.trail_pct_init)
-                                    else:
-                                        self._initial_risk_abs = None
-                                    self._entry_usdt = float(self._position.size_usdt)
-                                    self._tp1_done = False
-                                    self._tp2_done = False
-                                    self.jlog.trade_open(
-                                        self.cfg.symbol, desired,
-                                        float(self._entry_usdt), float(self._position.entry_price),
-                                        int(self._position.leverage),
-                                        reason="takeover_flip_open"
-                                    )
-                                else:
-                                    self.jlog.warn("open_failed_after_takeover_flip")
+                        pass
                     except Exception as fe:
                         self.jlog.exception(fe, where="takeover_active_flip")
                 else:
-                    self.jlog.heartbeat(status="takeover_none")
+                    self.jlog.heartbeat(status="takeover_none")  # <-- trailing lines (exist)
             except Exception as e:
                 self.jlog.exception(e, where="takeover_check")
 
@@ -356,6 +295,9 @@ class Orchestrator:
                         await asyncio.sleep(1.0)
                         continue
 
+                    # Final clamp: ensure stake never exceeds max notional guard
+                    stake = float(min(float(stake), float(self.cfg.max_notional_usdt)))
+
                     snapshot = {
                         "price": self._last_price,
                         "trail_init": scaled_trail_init,
@@ -402,8 +344,10 @@ class Orchestrator:
                     direction = 1 if pos.side == "long" else -1
                     change_abs = direction * (self._last_price - pos.entry_price)
 
-                    # Advisor-driven flip check (periodic)
-                    if (now - getattr(self, "_last_flip_eval_ts", 0.0)) >= max(3, self._params.intelligence_sec):
+                    # Advisor-driven flip check (periodic), but skip if still inside takeover grace window
+                    if (now >= float(self._takeover_grace_until)) and (
+                        (now - getattr(self, "_last_flip_eval_ts", 0.0)) >= max(3, self._params.intelligence_sec)
+                    ):
                         try:
                             ctx = self._context_block()
                             ctx["leverage"] = int(self.cfg.leverage)
