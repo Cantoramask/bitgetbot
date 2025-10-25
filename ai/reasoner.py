@@ -42,6 +42,18 @@ class Reasoner:
         self.req_timeout_sec = float(os.getenv("ADVISOR_TIMEOUT_SEC", "1.5"))
         self.max_retries = int(os.getenv("ADVISOR_MAX_RETRIES", "1") or 1)
 
+        # --- new: tunable edge gate knobs via env ---
+        # All values are basis points unless marked otherwise.
+        self.green_hurdle_bps = float(os.getenv("ADVISOR_GREEN_BPS", "5.0"))            # allow if net >= +0.05%
+        self.grey_low_bps = float(os.getenv("ADVISOR_GREY_LOW_BPS", "-10.0"))           # grey if net in [-0.10%, +0.05%)
+        self.grey_high_bps = float(os.getenv("ADVISOR_GREY_HIGH_BPS", "5.0"))
+        self.grey_stake_mult = float(os.getenv("ADVISOR_GREY_STAKE_MULT", "0.35"))      # suggest 35% size in grey zone
+        self.grey_trail_tighten = float(os.getenv("ADVISOR_GREY_TIGHTEN_PCT", "0.30"))  # tighten trails by 30% in grey
+
+        # funding modelling based on expected hold time, bounded
+        self.exp_hold_hours = float(os.getenv("ADVISOR_EXPECTED_HOLD_HOURS", "1.0"))
+        self.max_hold_hours = float(os.getenv("ADVISOR_MAX_HOLD_HOURS", "2.0"))
+
     # ---------- internal helpers ----------
 
     def _call_llm(self, prompt: str) -> str:
@@ -92,6 +104,17 @@ class Reasoner:
             return False, None, str(result["err"])
         return True, str(result["content"] or ""), ""
 
+    def _funding_bps_estimate(self, funding_rate_per_hour: Optional[float]) -> float:
+        """
+        Convert a per-hour funding rate to basis points for a bounded expected hold.
+        funding_rate_per_hour is a decimal, for example 0.0001 means 1 bp per hour.
+        """
+        if funding_rate_per_hour is None:
+            return 0.0
+        hold = max(0.0, min(self.exp_hold_hours, self.max_hold_hours))
+        # Use absolute value for a conservative cost estimate
+        return abs(funding_rate_per_hour) * hold * 10000.0
+
     # ---------- public API ----------
 
     def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[bool, float, str, float, Dict[str, float]]:
@@ -106,19 +129,21 @@ class Reasoner:
 
         fees_bps = float(snapshot.get("fees_bps", 6.0))
         slip_bps = float(snapshot.get("slip_bps", 1.0))
-        total_cost_bps = fees_bps + slip_bps
+        funding_rate = snapshot.get("funding")  # per hour as decimal
+        funding_bps = self._funding_bps_estimate(funding_rate)
+        total_cost_bps = fees_bps + slip_bps + funding_bps
 
         policy = (
-            "You are a cautious trading gate. Consider fees, slippage, funding direction, "
-            "realised volatility regime, and actual leverage. Prefer WAIT when edge is small. "
-            "Only ALLOW if edge_bps exceeds total_cost_bps by a modest buffer. "
-            "Output STRICT JSON only with keys: "
+            "You are a cautious trading gate. Estimate the expected gross edge in basis points "
+            "from this snapshot and return STRICT JSON. Consider leverage, funding direction, "
+            "open interest, volatility regime, and provided trail parameters. Do not include fees "
+            "or slippage or funding in your edge_bps. Only output JSON with keys: "
             '{"allow": boolean, "confidence": number, "edge_bps": number, '
             '"note": string, "overrides": {"trail_pct_init": number, '
             '"trail_pct_tight": number, "intelligence_sec": integer}}. '
             "Confidence is 0..1. If uncertain, lower confidence rather than forcing allow."
         )
-        prompt = f"{policy} Snapshot: {snapshot} total_cost_bps={total_cost_bps}"
+        prompt = f"{policy} Snapshot: {snapshot} total_cost_bps_hint={total_cost_bps:.2f}"
 
         ok = False
         content = None
@@ -133,9 +158,9 @@ class Reasoner:
 
         try:
             data = json.loads(content)
-            allow = bool(data.get("allow", True))
+            allow_llm = bool(data.get("allow", True))
             conf = float(data.get("confidence", 0.65))
-            edge_bps = float(data.get("edge_bps", 0.0))
+            edge_gross_bps = float(data.get("edge_bps", 0.0))
             note = str(data.get("note", ""))
             overrides = data.get("overrides") or {}
             safe_overrides: Dict[str, float] = {}
@@ -151,18 +176,49 @@ class Reasoner:
                     self.log.info(f"[AI] parse_fallback raw={str(content)[:200]!r}")
                 except Exception:
                     pass
-            allow = False
+            allow_llm = False
             conf = 0.60
-            edge_bps = 0.0
+            edge_gross_bps = 0.0
             note = "parse_fallback"
             safe_overrides = {}
 
-        if self.mode == "warn" and not allow:
-            # In warn mode we do NOT force allow; we only keep the note for visibility.
-            note = f"warn: {note}"
+        # --- new: local economic gate on NET edge (gross minus realistic costs) ---
+        net_edge_bps = edge_gross_bps - total_cost_bps
 
-        note_oneline = " ".join(str(note).split())[:300]
-        return allow, conf, note_oneline, edge_bps, safe_overrides
+        decision_note = note
+        allow_final = False
+        # default no extra suggestions
+        ov_out: Dict[str, float] = dict(safe_overrides)
+
+        if net_edge_bps >= self.green_hurdle_bps:
+            allow_final = True
+            decision_note = f"green net={net_edge_bps:.2f}bps gross={edge_gross_bps:.2f} cost={total_cost_bps:.2f} {note}"
+        elif self.grey_low_bps <= net_edge_bps < self.grey_high_bps:
+            allow_final = True
+            # tighten trails and suggest small stake for a probe
+            try:
+                trail_init = float(snapshot.get("trail_init", 0.002))
+                trail_tight = float(snapshot.get("trail_tight", 0.001))
+                tighten = max(0.0, min(self.grey_trail_tighten, 0.9))
+                ov_out["trail_pct_init"] = max(0.0003, trail_init * (1.0 - tighten))
+                ov_out["trail_pct_tight"] = max(0.0002, trail_tight * (1.0 - tighten))
+            except Exception:
+                pass
+            ov_out["stake_mult"] = float(self.grey_stake_mult)  # orchestrator may apply if supported
+            conf = min(conf, 0.75)
+            decision_note = f"grey probe net={net_edge_bps:.2f}bps gross={edge_gross_bps:.2f} cost={total_cost_bps:.2f} {note}"
+        else:
+            allow_final = False
+            decision_note = f"red net={net_edge_bps:.2f}bps gross={edge_gross_bps:.2f} cost={total_cost_bps:.2f} {note}"
+
+        # Respect warn mode semantics. In warn mode we do not force allow when advisor says no,
+        # but our local economic gate still determines the recommendation.
+        if self.mode == "warn" and not allow_final:
+            decision_note = f"warn: {decision_note}"
+
+        note_oneline = " ".join(str(decision_note).split())[:300]
+        # Return NET edge in edge_bps so the log reflects actionable economics.
+        return allow_final, float(conf), note_oneline, float(net_edge_bps), ov_out
 
     def decide(self, strategy, params, context: Dict[str, Any]):
         """
