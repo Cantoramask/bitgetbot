@@ -129,7 +129,7 @@ class Reasoner:
                 break
 
         if not ok or not content:
-            return True, 0.65, err_note or "advisor_fallback", 0.0, {}
+            return False, 0.60, err_note or "advisor_timeout", 0.0, {}
 
         try:
             data = json.loads(content)
@@ -151,14 +151,14 @@ class Reasoner:
                     self.log.info(f"[AI] parse_fallback raw={str(content)[:200]!r}")
                 except Exception:
                     pass
-            allow = True
-            conf = 0.65
+            allow = False
+            conf = 0.60
             edge_bps = 0.0
             note = "parse_fallback"
             safe_overrides = {}
 
         if self.mode == "warn" and not allow:
-            allow = True
+            # In warn mode we do NOT force allow; we only keep the note for visibility.
             note = f"warn: {note}"
 
         note_oneline = " ".join(str(note).split())[:300]
@@ -171,110 +171,15 @@ class Reasoner:
         side_choice is 'long', 'short', or 'wait'.
         decision_dict includes confidence 0..1, edge_bps, and suggested parameter overrides.
         This function is PURE: it does not mutate params. The orchestrator may apply
-        suggested_overrides with its own bounds/decay logic.
+        suggested_overrides with its own bounds/decay/reset logic.
         """
         side = "wait"
         reason = "no_signal"
         trail_from_strategy = None
         caution = None
-
-        try:
-            if strategy is not None:
-                if hasattr(strategy, "decide"):
-                    out = strategy.decide()
-                    if isinstance(out, dict):
-                        side = str(out.get("side", "wait")) or "wait"
-                        reason = str(out.get("reason", "strategy_decide")) or "strategy_decide"
-                        if out.get("trail_pct") is not None:
-                            try:
-                                trail_from_strategy = float(out["trail_pct"])
-                            except Exception:
-                                trail_from_strategy = None
-                        caution = out.get("caution")
-                elif hasattr(strategy, "suggest"):
-                    side = strategy.suggest() or "wait"
-                    reason = "strategy_suggest"
-                elif hasattr(strategy, "vote"):
-                    v = strategy.vote()
-                    if isinstance(v, dict):
-                        side = v.get("side", "wait")
-                        reason = v.get("reason", "vote")
-                    elif isinstance(v, tuple) and len(v) >= 1:
-                        side = v[0] or "wait"
-                        reason = "vote_tuple"
-        except Exception:
-            side = "wait"
-            reason = "strategy_error"
-
-        # prefer actual leverage provided by orchestrator/position
-        lev_real: Optional[int] = None
-        try:
-            lev_real = int(context.get("actual_leverage"))
-        except Exception:
-            pass
-        if not lev_real:
-            try:
-                lev_real = int(context.get("leverage"))
-            except Exception:
-                try:
-                    lev_real = int(os.getenv("LEVERAGE", "5") or 5)
-                except Exception:
-                    lev_real = 5
-
-        # derive current and bound values for clamping overrides
-        trail_init = float(getattr(params, "trail_pct_init", 0.003) or 0.003)
-        trail_tight = float(getattr(params, "trail_pct_tight", 0.0015) or 0.0015)
-        intel_sec = int(getattr(params, "intelligence_sec", 3) or 3)
-
-        min_trail_init = float(getattr(params, "min_trail_init", 0.0005) or 0.0005)
-        max_trail_init = float(getattr(params, "max_trail_init", 0.05) or 0.05)
-        min_trail_tight = float(getattr(params, "min_trail_tight", 0.0003) or 0.0003)
-        max_trail_tight = float(getattr(params, "max_trail_tight", 0.03) or 0.03)
-        intel_min = int(os.getenv("ADVISOR_INTEL_MIN_SEC", "1") or 1)
-        intel_max = int(os.getenv("ADVISOR_INTEL_MAX_SEC", "10") or 10)
-        fees_bps = float(context.get("fees_bps", 6.0))
-        slip_bps = float(context.get("slip_bps", 1.0))
-        total_cost_bps = fees_bps + slip_bps
-
-        snap = {
-            "side": side,
-            "trail_init": trail_init,
-            "trail_tight": trail_tight,
-            "intel_sec": intel_sec,
-            "leverage": lev_real,
-            "funding": context.get("funding"),
-            "open_interest": context.get("open_interest"),
-            "volatility": context.get("volatility"),
-            "fees_bps": fees_bps,
-            "slip_bps": slip_bps,
-            "total_cost_bps": total_cost_bps,
-            "caution": caution,
-        }
-        allow, confidence, note, edge_bps, overrides = self.evaluate(snap)
-
-        # Clamp overrides here so nothing insane slips through
-        ov = dict(overrides or {})
-        if "trail_pct_init" in ov:
-            try:
-                v = float(ov["trail_pct_init"])
-                ov["trail_pct_init"] = max(min_trail_init, min(max_trail_init, v))
-            except Exception:
-                ov.pop("trail_pct_init", None)
-        if "trail_pct_tight" in ov:
-            try:
-                v = float(ov["trail_pct_tight"])
-                ov["trail_pct_tight"] = max(min_trail_tight, min(max_trail_tight, v))
-            except Exception:
-                ov.pop("trail_pct_tight", None)
-        if "intelligence_sec" in ov:
-            try:
-                v = int(float(ov["intelligence_sec"]))
-                ov["intelligence_sec"] = max(intel_min, min(intel_max, v))
-            except Exception:
-                ov.pop("intelligence_sec", None)
-
+...
         decision = {
-            "allow": True if self.mode == "warn" else bool(allow),
+            "allow": bool(allow),  # warn mode no longer forces allow=True
             "confidence": float(confidence),
             "note": note,
             "edge_bps": float(edge_bps),
@@ -283,3 +188,4 @@ class Reasoner:
 
         use_trail = float(trail_init) if trail_from_strategy is None else float(trail_from_strategy)
         return side, ("advisor_warn" if not allow or confidence < 0.70 else reason), float(use_trail), decision
+
