@@ -218,6 +218,7 @@ class Orchestrator:
                                 vol_profile=self.cfg.vol_profile,
                                 now_ts=time.time(),
                                 is_flip=True,
+                                confidence=conf,
                             )
                             if not allowed:
                                 self.jlog.warn("risk_block_flip", **info)
@@ -346,6 +347,7 @@ class Orchestrator:
                         vol_profile=self.cfg.vol_profile,
                         now_ts=now,
                         is_flip=None,
+                        confidence=confidence,
                     )
                     if info.get("warnings"):
                         self.jlog.warn("risk_warnings", warnings=info["warnings"])
@@ -360,12 +362,14 @@ class Orchestrator:
                         "trail_tight": scaled_trail_tight,
                         "intel_sec": self._params.intelligence_sec,
                         "stake": stake,
+                        "stake_scaled": round(float(self.cfg.stake_usdt) * conf_effect, 6),
                         "lev": int(self.cfg.leverage),
                         "vol": self.cfg.vol_profile,
                         "confidence": round(confidence, 3),
                         "funding": context.get("funding"),
                         "oi": context.get("open_interest"),
                         "volsnap": context.get("volatility"),
+                        "vol_slope": getattr(self.strategy, "vol_slope_status", None),
                     }
                     self.jlog.heartbeat(status="open", **snapshot)
 
@@ -433,6 +437,7 @@ class Orchestrator:
                                     vol_profile=self.cfg.vol_profile,
                                     now_ts=time.time(),
                                     is_flip=True,
+                                    confidence=conf,
                                 )
                                 if not allowed:
                                     self.jlog.warn("risk_block_flip", **info)
@@ -584,6 +589,7 @@ class Orchestrator:
                     "funding": ctx.get("funding"),
                     "open_interest": ctx.get("open_interest"),
                     "volatility": ctx.get("volatility"),
+                    "vol_slope": getattr(self.strategy, "vol_slope_status", None),
                 })
                 self.jlog.heartbeat(**st)
                 await asyncio.sleep(max(1, hb_interval))

@@ -202,7 +202,8 @@ class RiskManager:
         requested_leverage: int,
         vol_profile: str = "Medium",   # "High"|"Medium"|"Low"
         now_ts: Optional[float] = None,
-        is_flip: Optional[bool] = None
+        is_flip: Optional[bool] = None,
+        confidence: Optional[float] = None,   # advisor confidence 0..1 for audit
     ) -> Tuple[bool, float, Dict[str, Any]]:
         """
         Decide if a new order is allowed, and what stake to use.
@@ -234,6 +235,18 @@ class RiskManager:
             scale_vol = limits.vol_stake_scale_medium
 
         scale_lev = self._lev_stake_scale(lev)
+
+        # Confidence is for audit only here (stake was already scaled upstream)
+        try:
+            conf = float(confidence) if confidence is not None else None
+            if conf is not None:
+                conf_effect = max(0.5, min(1.0, conf))
+            else:
+                conf_effect = None
+        except Exception:
+            conf = None
+            conf_effect = None
+
         stake = float(requested_stake_usdt) * float(scale_vol) * float(scale_lev)
 
         # Max stake fence
@@ -256,7 +269,17 @@ class RiskManager:
             allowed = False
 
         # Cooldowns
-        remain_exit = self._remaining(self.state.last_exit_ts, limits.reopen_cooldown_sec, now)
+        # Reopen cooldown scaled by volatility regime:
+        # calm (Low) -> 0.5x, wild (High) -> 1.5x, otherwise 1.0x
+        if v == "low":
+            reopen_factor = 0.5
+        elif v == "high":
+            reopen_factor = 1.5
+        else:
+            reopen_factor = 1.0
+        eff_reopen_cd = int(round(limits.reopen_cooldown_sec * reopen_factor))
+
+        remain_exit = self._remaining(self.state.last_exit_ts, eff_reopen_cd, now)
         if remain_exit > 0:
             reasons.append(f"reopen cooldown {remain_exit}s")
             allowed = False
@@ -273,7 +296,6 @@ class RiskManager:
         remain_flip = self._remaining(self.state.last_flip_ts, limits.flip_cooldown_sec, now) if is_flip else 0
         if is_flip and remain_flip > 0:
             warnings.append(f"flip cooldown {remain_flip}s (allowed during active flip)")
-            # allow flips even during cooldown; do not block here
 
         info = {
             "symbol": symbol,
@@ -284,14 +306,17 @@ class RiskManager:
             "requested_leverage": int(requested_leverage),
             "scaled_by_vol": scale_vol,
             "scaled_by_leverage": scale_lev,
+            "scaled_by_confidence": conf_effect,
+            "requested_confidence": conf,
             "effective_notional_usdt": round(notional, 8),
             "reasons": reasons,
             "warnings": warnings,
             "cooldowns": {
-                "reopen_sec": max(0, limits.reopen_cooldown_sec - int(now - self.state.last_exit_ts)),
+                "reopen_sec": max(0, eff_reopen_cd - int(now - self.state.last_exit_ts)),
                 "loss_sec": max(0, eff_loss_cd - int(now - self.state.last_loss_ts)),
                 "flip_sec": max(0, limits.flip_cooldown_sec - int(now - self.state.last_flip_ts)) if is_flip else 0,
             },
+            "reopen_cd_scaled": eff_reopen_cd,
             "daily_loss_so_far": round(daily_loss, 8),
             "daily_loss_budget_left": round(remaining_loss_budget, 8),
             "vol_profile": vol_profile,

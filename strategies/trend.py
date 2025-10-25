@@ -8,8 +8,9 @@ Outputs: side in {"long","short","wait"}, reason, trail_pct, caution.
 from __future__ import annotations
 
 import math
+import statistics
 import collections
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, Optional, List
 
 class TrendStrategy:
     def __init__(self, *, fast:int=9, slow:int=21, atr_len:int=14,
@@ -26,17 +27,18 @@ class TrendStrategy:
         self.min_trail = float(min_trail)
         self.max_trail = float(max_trail)
         self._lev = 1
-        self._prices: Deque[float] = collections.deque(maxlen=max(slow, atr_len) + 2)
+        self._prices: Deque[float] = collections.deque(maxlen=max(slow, self.atr_len) + 120)  # extra room
+        self._vol_slope_status: Optional[str] = None  # "up" | "down" | "flat"
 
     def set_windows(self, fast:int, slow:int) -> None:
         if fast < slow and fast > 0:
             self.fast = int(fast)
             self.slow = int(slow)
-            self._prices = collections.deque(self._prices, maxlen=max(self.slow, self.atr_len) + 2)
+            self._prices = collections.deque(self._prices, maxlen=max(self.slow, self.atr_len) + 120)
 
     def set_atr_len(self, n:int) -> None:
         self.atr_len = max(5, int(n))
-        self._prices = collections.deque(self._prices, maxlen=max(self.slow, self.atr_len) + 2)
+        self._prices = collections.deque(self._prices, maxlen=max(self.slow, self.atr_len) + 120)
 
     def update_tick(self, price: float) -> None:
         if not math.isfinite(price) or price <= 0:
@@ -63,10 +65,52 @@ class TrendStrategy:
             diffs.append(abs(b - a) / max(1.0, a))
         return sum(diffs)/len(diffs) if diffs else 0.0
 
+    def _pct_changes(self) -> List[float]:
+        ps = list(self._prices)
+        out: List[float] = []
+        for i in range(1, len(ps)):
+            a = ps[i-1]; b = ps[i]
+            if a > 0:
+                out.append((b - a) / a)
+        return out
+
+    def _std_pct(self, n:int) -> Optional[float]:
+        ch = self._pct_changes()
+        if len(ch) < n:
+            return None
+        seg = ch[-n:]
+        try:
+            return float(statistics.pstdev(seg))
+        except Exception:
+            return None
+
+    def _vol_slope(self) -> Optional[str]:
+        """
+        Compare long window std (60) to short window std (10).
+        If long > short by a small band, volatility is rising ("up").
+        If long < short by a small band, volatility is easing ("down").
+        Else "flat".
+        """
+        long_std = self._std_pct(60)
+        short_std = self._std_pct(10)
+        if long_std is None or short_std is None:
+            return None
+        band = max(1e-6, short_std * 0.05)  # 5% band of the short std
+        if long_std > short_std + band:
+            return "up"
+        if long_std < short_std - band:
+            return "down"
+        return "flat"
+
+    @property
+    def vol_slope_status(self) -> Optional[str]:
+        return self._vol_slope_status
+
     def decide(self) -> Dict[str, object]:
         fast = self._sma(self.fast)
         slow = self._sma(self.slow)
         if fast is None or slow is None:
+            self._vol_slope_status = None
             return {"side": "wait", "reason": "warming_up", "trail_pct": self.min_trail, "caution": None}
 
         atrp = self._atr_pct() or 0.0
@@ -75,9 +119,20 @@ class TrendStrategy:
         lev_tight = base_trail / (self._lev ** 0.5)
         trail = max(self.min_trail, min(self.max_trail, lev_tight))
 
+        # Volatility slope tweak (predictive modelling lite)
+        slope = self._vol_slope()
+        self._vol_slope_status = slope
+        if slope == "up":
+            trail = max(self.min_trail, min(self.max_trail, trail * 0.9))   # tighten a bit
+            caution = "elevated_volatility"
+        elif slope == "down":
+            trail = max(self.min_trail, min(self.max_trail, trail * 1.05))  # allow a touch wider
+            caution = None
+        else:
+            caution = None
+
         side = "wait"
         reason = "flat"
-        caution = None
 
         # Simple crossover with mild percentage band (≈2 bps) to avoid whipsaw
         band_pct = 0.0002
@@ -87,10 +142,6 @@ class TrendStrategy:
             side = "short"; reason = "fast_below_slow"
         else:
             side = "wait"; reason = "near_equilibrium"
-
-        # Extra caution after a sudden jump
-        if atrp > 0.01:
-            caution = "elevated_volatility"
 
         return {
             "side": side,
