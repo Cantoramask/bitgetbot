@@ -224,10 +224,16 @@ def _load_orchestrator(cfg: AppConfig, logger: logging.Logger):
     try:
         import importlib
 
-        orch_module = importlib.import_module("orchestrator")
+        # Try the real package path first: bitgetbot/orchestrator.py
+        try:
+            orch_module = importlib.import_module("bitgetbot.orchestrator")
+        except ModuleNotFoundError:
+            # Fallback to a flat file named orchestrator.py if present
+            orch_module = importlib.import_module("orchestrator")
+
         Orchestrator = getattr(orch_module, "Orchestrator", None)
         if Orchestrator is None:
-            raise AttributeError("orchestrator.Orchestrator not found")
+            raise AttributeError("Orchestrator class not found in orchestrator module")
         return Orchestrator(cfg, logger)
     except Exception as e:
         logger.info(f"[INFO] Using fallback orchestrator: {e}")
