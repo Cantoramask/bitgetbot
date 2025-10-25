@@ -57,24 +57,34 @@ class Reasoner:
         )
 
         try:
-            import json
-            data = json.loads(content)
-            allow = bool(data.get("allow", True))
-            conf = float(data.get("confidence", 0.75 if allow else 0.55))
-            note = str(data.get("note", ""))
-        except Exception:
-            low = content.lower()
-            allow = ("\"allow\": true" in low) or ("allow: true" in low) or ("allow\":true" in low)
-            conf = 0.75 if allow else 0.55
-            note = content
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            content = (resp.choices[0].message.content or "").strip()
 
-        # override: never hard-block when ADVISOR_MODE=warn
-        if self.mode == "warn" and not allow:
-            allow = True
-            note = f"warn: {note}"
+            try:
+                import json
+                data = json.loads(content)
+                allow = bool(data.get("allow", True))
+                conf = float(data.get("confidence", 0.75 if allow else 0.55))
+                note = str(data.get("note", ""))
+            except Exception:
+                low = content.lower()
+                allow = ("\"allow\": true" in low) or ("allow: true" in low) or ("allow\":true" in low)
+                conf = 0.75 if allow else 0.55
+                note = content
 
-        note_oneline = " ".join(str(note).split())[:300]
-        return allow, conf, note_oneline
+            # override: never hard-block when ADVISOR_MODE=warn
+            if self.mode == "warn" and not allow:
+                allow = True
+                note = f"warn: {note}"
+
+            note_oneline = " ".join(str(note).split())[:300]
+            return allow, conf, note_oneline
+        except Exception as e:
+            return True, 1.0, f"advisor_error: {e}"
 
     def decide(self, strategy, params, context: Dict[str, Any]):
         """
@@ -88,7 +98,6 @@ class Reasoner:
         trail_from_strategy = None
         caution = None
 
-        # Use the strategy if available. Prefer a proper decide() method when present.
         try:
             if strategy is not None:
                 if hasattr(strategy, "decide"):
@@ -117,13 +126,11 @@ class Reasoner:
             side = "wait"
             reason = "strategy_error"
 
-        # Read leverage from context (fallback to env only if missing)
         try:
             lev_real = int(context.get("leverage"))
         except Exception:
             lev_real = int(os.getenv("LEVERAGE", "5") or 5)
 
-        # Auto-tighten when leverage is high (>=20)
         try:
             if lev_real >= 20:
                 params.trail_pct_init = max(params.min_trail_init, params.trail_pct_init * 0.7)
@@ -132,7 +139,6 @@ class Reasoner:
         except Exception:
             pass
 
-        # Advisor snapshot and evaluation
         snap = {
             "side": side,
             "trail_init": params.trail_pct_init,
@@ -151,7 +157,6 @@ class Reasoner:
             reason = "advisor_warn"
             decision = {"allow": True, "confidence": float(confidence), "note": f"warn: {note}"}
 
-        # Existing hard block on very low confidence or explicit can't-manage phrasing
         txt = (note or "").lower()
         says_cant_manage = any(k in txt for k in ("cannot manage", "can't manage", "unmanageable", "do not trade", "do not proceed"))
         hard_block = (confidence < 0.30) or says_cant_manage
@@ -159,7 +164,6 @@ class Reasoner:
             reason = "advisor_warn"
             decision = {"allow": True, "confidence": float(confidence), "note": f"warn: {note}"}
 
-        # Warn-but-allow band: 0.30 <= confidence < 0.70
         if confidence < 0.70:
             reason = "advisor_warn"
             try:
