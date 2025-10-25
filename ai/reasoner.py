@@ -15,7 +15,9 @@ API key is a secret string that proves who you are to a service like OpenAI.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Tuple
+import json
+import threading
+from typing import Any, Dict, Tuple, Optional
 
 try:
     from openai import OpenAI
@@ -24,7 +26,8 @@ except Exception:
 
 
 class Reasoner:
-    def __init__(self):
+    def __init__(self, logger=None):
+        self.log = logger
         self.enabled = os.getenv("ADVISOR_ENABLED", "false").lower() in ("1", "true", "y", "yes")
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.api_key = os.getenv("OPENAI_API_KEY", "")
@@ -36,62 +39,139 @@ class Reasoner:
                 self.client = None
 
         self.mode = os.getenv("ADVISOR_MODE", "warn").lower()
+        self.req_timeout_sec = float(os.getenv("ADVISOR_TIMEOUT_SEC", "1.5"))
+        self.max_retries = int(os.getenv("ADVISOR_MAX_RETRIES", "1") or 1)
 
-    def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[bool, float, str]:
-        """
-        Returns (allow, confidence, note).
-        When disabled or unavailable it returns (True, 1.0, "disabled").
-        """
-        if not self.enabled or not self.client:
-            return True, 1.0, "disabled"
+    # ---------- internal helpers ----------
 
-        policy = (
-            "Never block a trade. If leverage is high and parameters are not tightened, lower confidence and add a caution note. "
-            "Shorter intelligence_sec at higher leverage; smaller (tighter) trail percentages at higher leverage. "
-            "Consider funding and volatility; when mismatched, reduce confidence and add a caution."
-        )
-        prompt = (
-            "You are a cautious trading gate. Reply as compact JSON with keys "
-            '{"allow": boolean, "confidence": number 0..1, "note": string}. '
-            f"Policy: {policy} Snapshot: {snapshot}"
-        )
+    def _call_llm(self, prompt: str) -> str:
+        """
+        Blocking call. Wrapped by _safe_llm to avoid stalling any event loop.
+        """
+        if not self.client:
+            raise RuntimeError("no_client")
 
         try:
+            # Prefer strict JSON on newer SDKs
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                timeout=self.req_timeout_sec,  # supported on newer SDKs
             )
-            content = (resp.choices[0].message.content or "").strip()
+            return (resp.choices[0].message.content or "").strip()
+        except TypeError:
+            # Fallback for older SDKs without response_format/timeout kw
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+            )
+            return (resp.choices[0].message.content or "").strip()
 
+    def _safe_llm(self, prompt: str, timeout: float) -> Tuple[bool, Optional[str], str]:
+        """
+        Run _call_llm in a thread with a hard timeout.
+        Returns (ok, content, err_note)
+        """
+        result: Dict[str, Any] = {"content": None, "err": None}
+
+        def target():
             try:
-                import json
-                data = json.loads(content)
-                allow = bool(data.get("allow", True))
-                conf = float(data.get("confidence", 0.75 if allow else 0.55))
-                note = str(data.get("note", ""))
-            except Exception:
-                low = content.lower()
-                allow = ("\"allow\": true" in low) or ("allow: true" in low) or ("allow\":true" in low)
-                conf = 0.75 if allow else 0.55
-                note = content
+                result["content"] = self._call_llm(prompt)
+            except Exception as e:
+                result["err"] = f"advisor_error: {e}"
 
-            # override: never hard-block when ADVISOR_MODE=warn
-            if self.mode == "warn" and not allow:
-                allow = True
-                note = f"warn: {note}"
+        th = threading.Thread(target=target, daemon=True)
+        th.start()
+        th.join(timeout=timeout)
+        if th.is_alive():
+            return False, None, "advisor_timeout"
+        if result["err"] is not None:
+            return False, None, str(result["err"])
+        return True, str(result["content"] or ""), ""
 
-            note_oneline = " ".join(str(note).split())[:300]
-            return allow, conf, note_oneline
-        except Exception as e:
-            return True, 1.0, f"advisor_error: {e}"
+    # ---------- public API ----------
+
+    def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[bool, float, str, float, Dict[str, float]]:
+        """
+        Returns (allow, confidence, note, edge_bps, suggested_overrides)
+
+        When disabled or unavailable it returns a conservative pass:
+        (True, 0.65, "disabled", 0.0, {}).
+        """
+        if not self.enabled or not self.client:
+            return True, 0.65, "disabled", 0.0, {}
+
+        fees_bps = float(snapshot.get("fees_bps", 6.0))
+        slip_bps = float(snapshot.get("slip_bps", 1.0))
+        total_cost_bps = fees_bps + slip_bps
+
+        policy = (
+            "You are a cautious trading gate. Consider fees, slippage, funding direction, "
+            "realised volatility regime, and actual leverage. Prefer WAIT when edge is small. "
+            "Only ALLOW if edge_bps exceeds total_cost_bps by a modest buffer. "
+            "Output STRICT JSON only with keys: "
+            '{"allow": boolean, "confidence": number, "edge_bps": number, '
+            '"note": string, "overrides": {"trail_pct_init": number, '
+            '"trail_pct_tight": number, "intelligence_sec": integer}}. '
+            "Confidence is 0..1. If uncertain, lower confidence rather than forcing allow."
+        )
+        prompt = f"{policy} Snapshot: {snapshot} total_cost_bps={total_cost_bps}"
+
+        ok = False
+        content = None
+        err_note = ""
+        for _ in range(self.max_retries + 1):
+            ok, content, err_note = self._safe_llm(prompt, self.req_timeout_sec)
+            if ok and content:
+                break
+
+        if not ok or not content:
+            return True, 0.65, err_note or "advisor_fallback", 0.0, {}
+
+        try:
+            data = json.loads(content)
+            allow = bool(data.get("allow", True))
+            conf = float(data.get("confidence", 0.65))
+            edge_bps = float(data.get("edge_bps", 0.0))
+            note = str(data.get("note", ""))
+            overrides = data.get("overrides") or {}
+            safe_overrides: Dict[str, float] = {}
+            if "trail_pct_init" in overrides:
+                safe_overrides["trail_pct_init"] = float(overrides["trail_pct_init"])
+            if "trail_pct_tight" in overrides:
+                safe_overrides["trail_pct_tight"] = float(overrides["trail_pct_tight"])
+            if "intelligence_sec" in overrides:
+                safe_overrides["intelligence_sec"] = float(overrides["intelligence_sec"])
+        except Exception:
+            if self.log:
+                try:
+                    self.log.info(f"[AI] parse_fallback raw={str(content)[:200]!r}")
+                except Exception:
+                    pass
+            allow = True
+            conf = 0.65
+            edge_bps = 0.0
+            note = "parse_fallback"
+            safe_overrides = {}
+
+        if self.mode == "warn" and not allow:
+            allow = True
+            note = f"warn: {note}"
+
+        note_oneline = " ".join(str(note).split())[:300]
+        return allow, conf, note_oneline, edge_bps, safe_overrides
 
     def decide(self, strategy, params, context: Dict[str, Any]):
         """
         Returns side_choice, reason, trail_pct_to_use, decision_dict.
 
         side_choice is 'long', 'short', or 'wait'.
-        decision_dict includes confidence 0..1 so the orchestrator can scale stake and trail.
+        decision_dict includes confidence 0..1, edge_bps, and suggested parameter overrides.
+        This function is PURE: it does not mutate params. The orchestrator may apply
+        suggested_overrides with its own bounds/decay logic.
         """
         side = "wait"
         reason = "no_signal"
@@ -126,55 +206,80 @@ class Reasoner:
             side = "wait"
             reason = "strategy_error"
 
+        # prefer actual leverage provided by orchestrator/position
+        lev_real: Optional[int] = None
         try:
-            lev_real = int(context.get("leverage"))
-        except Exception:
-            lev_real = int(os.getenv("LEVERAGE", "5") or 5)
-
-        try:
-            if lev_real >= 20:
-                params.trail_pct_init = max(params.min_trail_init, params.trail_pct_init * 0.7)
-                params.trail_pct_tight = max(params.min_trail_tight, params.trail_pct_tight * 0.7)
-                params.intelligence_sec = max(2, int(params.intelligence_sec * 0.6))
+            lev_real = int(context.get("actual_leverage"))
         except Exception:
             pass
+        if not lev_real:
+            try:
+                lev_real = int(context.get("leverage"))
+            except Exception:
+                try:
+                    lev_real = int(os.getenv("LEVERAGE", "5") or 5)
+                except Exception:
+                    lev_real = 5
+
+        # derive current and bound values for clamping overrides
+        trail_init = float(getattr(params, "trail_pct_init", 0.003) or 0.003)
+        trail_tight = float(getattr(params, "trail_pct_tight", 0.0015) or 0.0015)
+        intel_sec = int(getattr(params, "intelligence_sec", 3) or 3)
+
+        min_trail_init = float(getattr(params, "min_trail_init", 0.0005) or 0.0005)
+        max_trail_init = float(getattr(params, "max_trail_init", 0.05) or 0.05)
+        min_trail_tight = float(getattr(params, "min_trail_tight", 0.0003) or 0.0003)
+        max_trail_tight = float(getattr(params, "max_trail_tight", 0.03) or 0.03)
+        intel_min = int(os.getenv("ADVISOR_INTEL_MIN_SEC", "1") or 1)
+        intel_max = int(os.getenv("ADVISOR_INTEL_MAX_SEC", "10") or 10)
+        fees_bps = float(context.get("fees_bps", 6.0))
+        slip_bps = float(context.get("slip_bps", 1.0))
+        total_cost_bps = fees_bps + slip_bps
 
         snap = {
             "side": side,
-            "trail_init": params.trail_pct_init,
-            "trail_tight": params.trail_pct_tight,
-            "intel_sec": params.intelligence_sec,
+            "trail_init": trail_init,
+            "trail_tight": trail_tight,
+            "intel_sec": intel_sec,
             "leverage": lev_real,
             "funding": context.get("funding"),
             "open_interest": context.get("open_interest"),
             "volatility": context.get("volatility"),
+            "fees_bps": fees_bps,
+            "slip_bps": slip_bps,
+            "total_cost_bps": total_cost_bps,
             "caution": caution,
         }
-        allow, confidence, note = self.evaluate(snap)
+        allow, confidence, note, edge_bps, overrides = self.evaluate(snap)
 
-        # Never hard-block on allow=False. Treat as warn and continue.
-        if not allow:
-            reason = "advisor_warn"
-            decision = {"allow": True, "confidence": float(confidence), "note": f"warn: {note}"}
-
-        txt = (note or "").lower()
-        says_cant_manage = any(k in txt for k in ("cannot manage", "can't manage", "unmanageable", "do not trade", "do not proceed"))
-        hard_block = (confidence < 0.30) or says_cant_manage
-        if hard_block:
-            reason = "advisor_warn"
-            decision = {"allow": True, "confidence": float(confidence), "note": f"warn: {note}"}
-
-        if confidence < 0.70:
-            reason = "advisor_warn"
+        # Clamp overrides here so nothing insane slips through
+        ov = dict(overrides or {})
+        if "trail_pct_init" in ov:
             try:
-                params.trail_pct_init = max(params.min_trail_init, params.trail_pct_init * 0.9)
-                params.trail_pct_tight = max(params.min_trail_tight, params.trail_pct_tight * 0.9)
-                params.intelligence_sec = max(2, int(params.intelligence_sec * 0.8))
+                v = float(ov["trail_pct_init"])
+                ov["trail_pct_init"] = max(min_trail_init, min(max_trail_init, v))
             except Exception:
-                pass
-            decision = {"allow": True, "confidence": float(confidence), "note": note}
-        else:
-            decision = {"allow": True, "confidence": float(confidence), "note": note}
+                ov.pop("trail_pct_init", None)
+        if "trail_pct_tight" in ov:
+            try:
+                v = float(ov["trail_pct_tight"])
+                ov["trail_pct_tight"] = max(min_trail_tight, min(max_trail_tight, v))
+            except Exception:
+                ov.pop("trail_pct_tight", None)
+        if "intelligence_sec" in ov:
+            try:
+                v = int(float(ov["intelligence_sec"]))
+                ov["intelligence_sec"] = max(intel_min, min(intel_max, v))
+            except Exception:
+                ov.pop("intelligence_sec", None)
 
-        use_trail = params.trail_pct_init if trail_from_strategy is None else float(trail_from_strategy)
-        return side, reason, float(use_trail), decision
+        decision = {
+            "allow": True if self.mode == "warn" else bool(allow),
+            "confidence": float(confidence),
+            "note": note,
+            "edge_bps": float(edge_bps),
+            "suggested_overrides": ov,
+        }
+
+        use_trail = float(trail_init) if trail_from_strategy is None else float(trail_from_strategy)
+        return side, ("advisor_warn" if not allow or confidence < 0.70 else reason), float(use_trail), decision

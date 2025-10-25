@@ -146,6 +146,18 @@ class Orchestrator:
         self._takeover_grace_sec = int(float(os.getenv("TAKEOVER_GRACE_SEC", "60")))
         self._takeover_grace_until = 0.0
 
+        # Defaults remembered for decay toward baseline
+        self._defaults = {
+            "trail_pct_init": self._params.trail_pct_init,
+            "trail_pct_tight": self._params.trail_pct_tight,
+            "intelligence_sec": self._params.intelligence_sec,
+        }
+
+        # Regime hysteresis bands (per-tick fractional vol)
+        self._regime_cut_low = 0.0015
+        self._regime_cut_high = 0.005
+        self._regime_hysteresis = 0.10  # 10% band to reduce flicker
+
     async def run(self):
         return await self.start()
 
@@ -271,6 +283,7 @@ class Orchestrator:
                 if self._position is None:
                     context = self._context_block()
                     context["leverage"] = int(self.cfg.leverage)
+                    context["actual_leverage"] = int(self.cfg.leverage)
                     side_choice, reason, trail, decision = self.reasoner.decide(self.strategy, self._params, context)
 
                     note = decision.get("note")
@@ -377,10 +390,16 @@ class Orchestrator:
                     ):
                         try:
                             ctx = self._context_block()
-                            ctx["leverage"] = int(self.cfg.leverage)
+                            # Use actual leverage while a position is open
+                            ctx["leverage"] = int(pos.leverage)
+                            ctx["actual_leverage"] = int(pos.leverage)
                             side_choice, reason, trail, decision = self.reasoner.decide(self.strategy, self._params, ctx)
                             desired = side_choice if side_choice in ("long", "short") else "wait"
                             conf = float(decision.get("confidence", 1.0))
+
+                            # Reset flip vote memory when advisor isn't calling for the opposite side
+                            if desired == "wait" or desired == pos.side:
+                                self._flip_vote = {"side": None, "count": 0, "last_ts": time.time()}
 
                             do_flip, why = self._should_flip(pos, desired, conf, ctx) if desired != "wait" else (False, "advisor_wait")
 
@@ -390,7 +409,7 @@ class Orchestrator:
                                     symbol=self.cfg.symbol,
                                     side=desired,
                                     requested_stake_usdt=float(self.cfg.stake_usdt),
-                                    requested_leverage=int(self.cfg.leverage),
+                                    requested_leverage=int(pos.leverage),
                                     vol_profile=self.cfg.vol_profile,
                                     now_ts=time.time(),
                                     is_flip=True,
@@ -437,30 +456,49 @@ class Orchestrator:
                                             int(self._position.leverage),
                                             reason="advisor_flip_open"
                                         )
+                                        self._save_state()
                                     else:
                                         self.jlog.warn("open_failed_after_flip", why=why)
                             else:
-                                # Prefer flat over flip when edge is tiny and PnL is around costs
-                                denom = pos.entry_price if pos.entry_price else 1e-9
-                                change_pct_signed = (1 if pos.side == "long" else -1) * (self._last_price - pos.entry_price) / denom
-                                change_bps = 10000.0 * change_pct_signed
-                                if abs(change_bps) <= (self._tx_cost_bps * 1.2):
-                                    pnl = await self.adapter.close_position(asdict(pos))
-                                    self._position = None
-                                    self._last_action_ts = time.time()
-                                    self.risk.note_exit()
-                                    self._note_trade_result(pnl)
-
-                                    self.jlog.trade_close(
-                                        self.cfg.symbol, pos.side,
-                                        float(self._entry_usdt or pos.size_usdt),
-                                        float(self._last_price or pos.entry_price),
-                                        float(pnl or 0.0),
-                                        self._wins, self._losses, self._success_rate,
-                                        reason="advisor_flat_small_edge"
-                                    )
+                                # If advisor says wait, do not discretionary-flat on tiny edge.
+                                if desired == "wait":
+                                    self.jlog.decision("hold", "advisor_wait", trail, cautions=why)
                                 else:
-                                    self.jlog.decision("hold", "flip_gated", trail, cautions=why)
+                                    # Prefer flat over flip when edge is tiny only if re-entry wouldn't be blocked
+                                    denom = pos.entry_price if pos.entry_price else 1e-9
+                                    change_pct_signed = (1 if pos.side == "long" else -1) * (self._last_price - pos.entry_price) / denom
+                                    change_bps = 10000.0 * change_pct_signed
+                                    if abs(change_bps) <= (self._tx_cost_bps * 1.2):
+                                        # Check whether we could reopen same side immediately; if not, avoid churn.
+                                        allowed_reopen, _, info_reopen = self.risk.check_order(
+                                            symbol=self.cfg.symbol,
+                                            side=pos.side,
+                                            requested_stake_usdt=float(self.cfg.stake_usdt),
+                                            requested_leverage=int(pos.leverage),
+                                            vol_profile=self.cfg.vol_profile,
+                                            now_ts=time.time(),
+                                            is_flip=None,
+                                            confidence=conf,
+                                        )
+                                        if allowed_reopen:
+                                            pnl = await self.adapter.close_position(asdict(pos))
+                                            self._position = None
+                                            self._last_action_ts = time.time()
+                                            self.risk.note_exit()
+                                            self._note_trade_result(pnl)
+
+                                            self.jlog.trade_close(
+                                                self.cfg.symbol, pos.side,
+                                                float(self._entry_usdt or pos.size_usdt),
+                                                float(self._last_price or pos.entry_price),
+                                                float(pnl or 0.0),
+                                                self._wins, self._losses, self._success_rate,
+                                                reason="advisor_flat_small_edge"
+                                            )
+                                        else:
+                                            self.jlog.decision("hold", "flat_blocked_by_reopen_cooldown", trail, cautions=info_reopen.get("reasons") or why)
+                                    else:
+                                        self.jlog.decision("hold", "flip_gated", trail, cautions=why)
                         except Exception as fe:
                             self.jlog.exception(fe, where="advisor_flip_eval")
                         self._last_flip_eval_ts = now
@@ -475,6 +513,7 @@ class Orchestrator:
                                 if newp:
                                     self._position = Position(**newp)  # type: ignore[arg-type]
                                 self.jlog.partial_close(self.cfg.symbol, pos.side, fraction=float(os.getenv("TP1_FRACTION", "0.30")), at_r=1.0, price=float(self._last_price), reason="partial_close_1R")
+                                self._save_state()
                         if (not self._tp2_done) and (change_abs >= 2.0 * self._initial_risk_abs):
                             ok = await self.adapter.close_position_fraction(asdict(pos), fraction=float(os.getenv("TP2_FRACTION", "0.30")))
                             if ok:
@@ -483,6 +522,7 @@ class Orchestrator:
                                 if newp:
                                     self._position = Position(**newp)  # type: ignore[arg-type]
                                 self.jlog.partial_close(self.cfg.symbol, pos.side, fraction=float(os.getenv("TP2_FRACTION", "0.30")), at_r=2.0, price=float(self._last_price), reason="partial_close_2R")
+                                self._save_state()
 
                     # Emergency exit (this is the “we really got it wrong” case)
                     denom = pos.entry_price if (pos.entry_price and pos.entry_price > 0) else 1e-9
@@ -496,7 +536,7 @@ class Orchestrator:
                             "trail_init": self._params.trail_pct_init,
                             "trail_tight": self._params.trail_pct_tight,
                             "intel_sec": self._params.intelligence_sec,
-                            "lev": int(self.cfg.leverage),
+                            "lev": int(pos.leverage),
                             "funding": self._context_block().get("funding"),
                             "open_interest": self._context_block().get("open_interest"),
                             "volatility": self._context_block().get("volatility"),
@@ -538,6 +578,7 @@ class Orchestrator:
                                         int(self._position.leverage),
                                         reason="flip_after_emergency"
                                     )
+                                    self._save_state()
                                 else:
                                     self.jlog.warn("open_failed_after_flip")
                             except Exception as fe:
@@ -545,9 +586,12 @@ class Orchestrator:
                         await asyncio.sleep(0.5)
                         continue
 
-                    # Normal trailing exit: directional instead of absolute
+                    # Normal trailing exit: add economic sanity to avoid fee churn in chop
                     trigger = self._params.trail_pct_tight * 0.5
-                    if change_pct <= -trigger:
+                    tx_guard_bps = self._tx_cost_bps * 1.2
+                    move_bps_from_entry = 10000.0 * ((self._last_price - pos.entry_price) / denom) * (1 if pos.side == "long" else -1)
+
+                    if change_pct <= -trigger and abs(move_bps_from_entry) > tx_guard_bps:
                         pnl = await self.adapter.close_position(asdict(pos))
                         self._position = None
                         self._last_action_ts = time.time()
@@ -602,18 +646,98 @@ class Orchestrator:
             self.jlog.exception(e, where="regime")
 
     async def _infer_vol_profile(self, force: bool):
+        """
+        Map feeder's per-tick fractional volatility to a regime with small hysteresis.
+        Skips updates when context is stale or during warm-up, unless force=True.
+        """
         try:
-            pass
+            ctx = self.feeder.context()
+            vol = float(ctx.get("vol_snapshot") or 0.0)
+            is_stale = bool(ctx.get("is_stale_ctx"))
+            tick_count = int(ctx.get("tick_count") or 0)
+
+            if not force:
+                if is_stale or tick_count < 60:
+                    return
+
+            current = str(self.cfg.vol_profile or "Medium")
+
+            low_cut_up = self._regime_cut_low * (1.0 + self._regime_hysteresis)
+            low_cut_down = self._regime_cut_low * (1.0 - self._regime_hysteresis)
+            high_cut_up = self._regime_cut_high * (1.0 + self._regime_hysteresis)
+            high_cut_down = self._regime_cut_high * (1.0 - self._regime_hysteresis)
+
+            new_profile = current
+            if current == "Low":
+                if vol >= low_cut_up and vol < high_cut_down:
+                    new_profile = "Medium"
+                elif vol >= high_cut_up:
+                    new_profile = "High"
+            elif current == "Medium":
+                if vol < low_cut_down:
+                    new_profile = "Low"
+                elif vol >= high_cut_up:
+                    new_profile = "High"
+            else:  # current == "High" or unknown
+                if vol < high_cut_down and vol >= low_cut_up:
+                    new_profile = "Medium"
+                elif vol < low_cut_down:
+                    new_profile = "Low"
+
+            if force or new_profile != current:
+                self.cfg.vol_profile = new_profile
+                self.jlog.heartbeat(status="regime", vol_profile=new_profile, vol_snapshot=vol)
         except Exception as e:
             self.jlog.exception(e, where="infer_vol")
 
     def _auto_tune_params(self):
-        pass
+        """
+        Light-touch tuning. Keep inside provided min and max. Drift back to defaults.
+        Skip when context is stale or during warm-up.
+        """
+        try:
+            ctx = self.feeder.context()
+            is_stale = bool(ctx.get("is_stale_ctx"))
+            tick_count = int(ctx.get("tick_count") or 0)
+            if is_stale or tick_count < 60:
+                return
+
+            # decay toward defaults so we never ratchet forever
+            decay = 0.2
+            self._params.trail_pct_init = (
+                (1 - decay) * self._params.trail_pct_init + decay * self._defaults["trail_pct_init"]
+            )
+            self._params.trail_pct_tight = (
+                (1 - decay) * self._params.trail_pct_tight + decay * self._defaults["trail_pct_tight"]
+            )
+            self._params.intelligence_sec = int(
+                round((1 - decay) * self._params.intelligence_sec + decay * self._defaults["intelligence_sec"])
+            )
+
+            regime = str(self.cfg.vol_profile or "Medium")
+            sr = float(self._success_rate)
+
+            if regime == "High" or sr < 0.45:
+                self._params.trail_pct_init = min(self._params.max_trail_init, self._params.trail_pct_init * 1.10)
+                self._params.trail_pct_tight = min(self._params.max_trail_tight, self._params.trail_pct_tight * 1.10)
+                self._params.intelligence_sec = min(30, self._params.intelligence_sec + 1)
+            elif regime == "Low" and sr > 0.60:
+                self._params.trail_pct_init = max(self._params.min_trail_init, self._params.trail_pct_init * 0.95)
+                self._params.trail_pct_tight = max(self._params.min_trail_tight, self._params.trail_pct_tight * 0.95)
+                self._params.intelligence_sec = max(6, self._params.intelligence_sec - 1)
+
+            # final clamps
+            self._params.trail_pct_init = self._clamp(self._params.trail_pct_init, self._params.min_trail_init, self._params.max_trail_init)
+            self._params.trail_pct_tight = self._clamp(self._params.trail_pct_tight, self._params.min_trail_tight, self._params.max_trail_tight)
+        except Exception as e:
+            self.jlog.exception(e, where="auto_tune")
 
     def _snapshot(self) -> Dict[str, Any]:
+        # Use actual leverage in snapshot if a position is open, else configured leverage
+        lev = int(self._position.leverage) if self._position else int(self.cfg.leverage)
         return {
             "live": self.cfg.live,
-            "leverage": self.cfg.leverage,
+            "leverage": lev,
             "margin_mode": self.cfg.margin_mode,
             "vol_profile": self.cfg.vol_profile,
             "takeover": getattr(self.cfg, "takeover", False),
@@ -632,7 +756,7 @@ class Orchestrator:
                 "ts": time.time(),
                 "symbol": self.cfg.symbol,
                 "live": bool(self.cfg.live),
-                "leverage": int(self.cfg.leverage),
+                "leverage": int(self._position.leverage) if self._position else int(self.cfg.leverage),
                 "margin_mode": str(self.cfg.margin_mode),
                 "vol_profile": str(self.cfg.vol_profile),
                 "wins": int(self._wins),

@@ -50,6 +50,9 @@ class BitgetAdapter:
         self._markets = None
         self._market = None
         self._lev_verified_ts = 0.0
+        # leverage backoff state to avoid noisy retries on failure
+        self._lev_backoff_sec = 0.0
+        self._lev_backoff_until = 0.0
 
     async def connect(self):
         await self._ensure_markets()
@@ -81,6 +84,8 @@ class BitgetAdapter:
             try:
                 await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
                 self._lev_verified_ts = time.time()
+                self._lev_backoff_sec = 0.0
+                self._lev_backoff_until = 0.0
             except Exception as e:
                 max_lev = int(self._market.get("limits", {}).get("leverage", {}).get("max") or self.leverage)
                 probed = False
@@ -90,12 +95,17 @@ class BitgetAdapter:
                         self.leverage = lev
                         probed = True
                         self._lev_verified_ts = time.time()
+                        self._lev_backoff_sec = 0.0
+                        self._lev_backoff_until = 0.0
                         self.log.info(f"[EX] leverage set to {lev} after adjust")
                         break
                     except Exception:
                         continue
                 if not probed:
                     self.log.info(f"[EX] set_leverage failed for all attempts: {e}")
+                    # start backoff since we failed at boot
+                    self._lev_backoff_sec = max(self._lev_backoff_sec or 30.0, 30.0)
+                    self._lev_backoff_until = time.time() + self._lev_backoff_sec
 
     async def fetch_ticker(self) -> Dict[str, Any]:
         def _fetch():
@@ -124,49 +134,55 @@ class BitgetAdapter:
             self.log.info(f"[EX] fetch_positions error: {e}")
             return None
 
-        for r in rows or []:
-            try:
-                if str(r.get("symbol") or "") != _sym:
+        def _parse(rows_in):
+            for r in rows_in or []:
+                try:
+                    if str(r.get("symbol") or "") != _sym:
+                        continue
+
+                    amt = float(r.get("contracts", r.get("amount", 0)) or 0.0)
+                    if abs(amt) < 1e-12:
+                        continue
+
+                    side = "long" if amt > 0 else "short"
+                    entry = float(r.get("entryPrice") or r.get("entry_price") or r.get("avgPrice") or 0.0)
+                    lev = int(r.get("leverage") or self.leverage)
+
+                    px = float(entry)
+                    if px <= 0:
+                        try:
+                            t = self.ex.fetch_ticker(_sym)
+                            px = float(t.get("last") or t.get("close") or 0.0)
+                        except Exception:
+                            px = 0.0
+
+                    size_usdt = abs(amt) * px
+
+                    return {
+                        "symbol": _sym,
+                        "side": side,
+                        "size_usdt": float(size_usdt),
+                        "entry_price": float(entry),
+                        "leverage": lev,
+                        "contracts": float(abs(amt)),
+                    }
+                except Exception as inner:
+                    self.log.info(f"[EX] parse_position error: {inner}")
                     continue
+            return None
 
-                # contracts/amount: positive long, negative short across most ccxt derivatives
-                amt = float(r.get("contracts", r.get("amount", 0)) or 0.0)
-                if abs(amt) < 1e-12:
-                    continue  # empty
+        pos = _parse(rows)
+        # If entry is missing right after a takeover/open, retry once to stabilise
+        if pos and (pos["entry_price"] <= 0 or pos["size_usdt"] <= 0):
+            try:
+                rows2 = await asyncio.to_thread(_pos)
+                pos2 = _parse(rows2)
+                if pos2:
+                    pos = pos2
+            except Exception:
+                pass
 
-                side = "long" if amt > 0 else "short"
-
-                # Entry price may be under different keys depending on ccxt version
-                entry = float(r.get("entryPrice") or r.get("entry_price") or r.get("avgPrice") or 0.0)
-
-                # Leverage best-effort
-                lev = int(r.get("leverage") or self.leverage)
-
-                # Notional in USDT is contracts * price.
-                # Do NOT clamp prices to >= 1.0 because many alts trade below 1 USDT.
-                px = float(entry)
-                if px <= 0:
-                    try:
-                        t = self.ex.fetch_ticker(_sym)
-                        px = float(t.get("last") or t.get("close") or 0.0)
-                    except Exception:
-                        px = 0.0
-
-                size_usdt = abs(amt) * px
-
-                return {
-                    "symbol": _sym,
-                    "side": side,
-                    "size_usdt": float(size_usdt),
-                    "entry_price": float(entry),
-                    "leverage": lev,
-                    "contracts": float(abs(amt)),
-                }
-            except Exception as inner:
-                self.log.info(f"[EX] parse_position error: {inner}")
-                continue
-
-        return None
+        return pos
 
     async def get_all_open_positions(self) -> list[Dict[str, Any]]:
         """
@@ -199,7 +215,6 @@ class BitgetAdapter:
                 entry = float(r.get("entryPrice") or r.get("entry_price") or r.get("avgPrice") or 0.0)
                 lev = int(r.get("leverage") or self.leverage)
 
-                # Same notional logic, no clamping
                 px = float(entry)
                 if px <= 0:
                     try:
@@ -224,43 +239,104 @@ class BitgetAdapter:
 
         return out
 
-    def _amount_from_usdt(self, usdt: float, price: float) -> float:
+    def _amount_from_usdt(self, usdt: float, price: float, *, strict_min: bool = False) -> Optional[float]:
+        """
+        Convert a USDT stake into contracts, respecting leverage, step, min and max.
+        If strict_min is True and the computed amount cannot meet the min lot after rounding,
+        return None so callers can decide how to react.
+        """
         notional = float(usdt) * max(1, int(self.leverage))
-        amount = notional / max(1.0, float(price))
+        amount = notional / max(1e-12, float(price))  # tiny floor avoids divide-by-zero without bias
+
+        # Exchange limits
+        limits = self._market.get("limits", {}) or {}
+        amt_limits = limits.get("amount", {}) or {}
+        step = amt_limits.get("step")
+        min_amt = float(amt_limits.get("min") or 0.0)
+        max_amt = amt_limits.get("max")
+        max_amt = float(max_amt) if max_amt is not None else None
+
+        # First try ccxt helper
         try:
             amount = float(self.ex.amount_to_precision(self.symbol, amount))
         except Exception:
-            prec = self._market["precision"].get("amount", None)
-            if isinstance(prec, (int, float)) and prec > 0:
-                step = float(prec)
-                amount = math.floor(amount / step) * step
-        min_amt = float(self._market["limits"]["amount"]["min"] or 0)
+            # Step rounding
+            if step is not None:
+                try:
+                    step_f = float(step)
+                    if step_f > 0:
+                        amount = math.floor(amount / step_f) * step_f
+                except Exception:
+                    pass
+            else:
+                # Fall back to decimal places in market.precision.amount
+                prec = self._market.get("precision", {}).get("amount")
+                if isinstance(prec, int) and prec >= 0:
+                    factor = 10 ** int(prec)
+                    amount = math.floor(amount * factor) / factor
+
+        # Enforce min and max after rounding
         if amount < min_amt:
+            if strict_min:
+                self.log.info(f"[EX] amount below min lot after rounding stake={usdt} price={price} amt={amount} min_amt={min_amt}")
+                return None
             amount = min_amt
+        if max_amt is not None and amount > max_amt:
+            # Cap to max and align to step if available
+            amount = max_amt
+            if step is not None:
+                try:
+                    step_f = float(step)
+                    if step_f > 0:
+                        amount = math.floor(amount / step_f) * step_f
+                except Exception:
+                    pass
+
         return float(amount)
 
     async def _ensure_leverage_applied(self) -> None:
         if not self.live:
             return
-        if time.time() - self._lev_verified_ts > 30:
-            try:
-                await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
-                self._lev_verified_ts = time.time()
-            except Exception as e:
-                self.log.info(f"[EX] reapply leverage warn: {e}")
+
+        now = time.time()
+
+        # Respect backoff window if a previous attempt failed
+        if self._lev_backoff_until and now < self._lev_backoff_until:
+            return
+
+        # Periodic refresh only if enough time since last verified
+        if now - self._lev_verified_ts <= 30.0:
+            return
+        try:
+            await asyncio.to_thread(self.ex.set_leverage, self.leverage, self.symbol)
+            self._lev_verified_ts = now
+            self._lev_backoff_sec = 0.0
+            self._lev_backoff_until = 0.0
+        except Exception as e:
+            # Start or grow exponential backoff up to 15 minutes
+            self._lev_backoff_sec = max(self._lev_backoff_sec * 2 if self._lev_backoff_sec else 30.0, 30.0)
+            self._lev_backoff_sec = min(self._lev_backoff_sec, 900.0)
+            self._lev_backoff_until = now + self._lev_backoff_sec
+            self.log.info(f"[EX] reapply leverage warn: {e} (backing off {int(self._lev_backoff_sec)}s)")
 
     async def place_order(self, side: str, usdt: float) -> Optional[Dict[str, Any]]:
         await self._ensure_leverage_applied()
         t = await self.fetch_ticker()
         price = float(t["price"])
-        amount = self._amount_from_usdt(usdt, price)
+        amount = self._amount_from_usdt(usdt, price, strict_min=True)
+        if amount is None or amount <= 0:
+            # Too small to trade after rounding to exchange rules
+            self.log.info(f"[EX] place_order rejected: stake too small for min lot side={side} stake={usdt} price={price}")
+            return None
+
         req_side = "buy" if side == "long" else "sell"
 
         if not self.live:
+            # Paper should mirror live: size_usdt equals contracts * price (≈ stake × leverage)
             return {
                 "symbol": self.symbol,
                 "side": side,
-                "size_usdt": float(usdt),
+                "size_usdt": float(amount * price),
                 "entry_price": price,
                 "leverage": self.leverage,
                 "contracts": amount,
@@ -279,8 +355,22 @@ class BitgetAdapter:
                 return None
 
         filled = float(o.get("filled", amount) or amount)
+        if not math.isfinite(filled) or filled <= 0:
+            filled = amount
+        if "limits" in self._market and "amount" in self._market["limits"]:
+            m = self._market["limits"]["amount"]
+            if m.get("max") is not None:
+                try:
+                    filled = min(filled, float(m["max"]))
+                except Exception:
+                    pass
         avg = float(o.get("average", price) or price)
-        size_usdt = filled * avg
+        cost = o.get("cost")
+        try:
+            size_usdt = float(cost) if cost is not None else filled * avg
+        except Exception:
+            size_usdt = filled * avg
+
         return {
             "symbol": self.symbol,
             "side": side,
@@ -295,7 +385,9 @@ class BitgetAdapter:
         amt = float(pos.get("contracts") or 0.0)
         if amt <= 0:
             t = await self.fetch_ticker()
-            amt = self._amount_from_usdt(pos["size_usdt"], t["price"])
+            # Estimation path for closes should not hard fail on min lot
+            new_amt = self._amount_from_usdt(pos["size_usdt"], t["price"], strict_min=False)
+            amt = float(new_amt or 0.0)
 
         close_side = "sell" if pos["side"] == "long" else "buy"
         params = {"reduceOnly": True}
@@ -304,7 +396,8 @@ class BitgetAdapter:
             t = await self.fetch_ticker()
             px = float(t["price"])
             direction = 1 if pos["side"] == "long" else -1
-            pnl_pct = direction * (px - float(pos["entry_price"])) / max(1.0, float(pos["entry_price"]))
+            denom = max(1e-12, float(pos["entry_price"]))
+            pnl_pct = direction * (px - float(pos["entry_price"])) / denom
             return float(pos["size_usdt"]) * pnl_pct
 
         def _order():
@@ -320,7 +413,11 @@ class BitgetAdapter:
             t = await self.fetch_ticker()
             exit_px = float(t["price"])
         direction = 1 if pos["side"] == "long" else -1
-        pnl_pct = direction * (exit_px - float(pos["entry_price"])) / max(1.0, float(pos["entry_price"]))
+        avg_entry = float(pos["entry_price"])
+        if not math.isfinite(avg_entry) or avg_entry <= 0:
+            return None
+        denom = max(1e-12, avg_entry)
+        pnl_pct = direction * (exit_px - avg_entry) / denom
         return float(pos["size_usdt"]) * pnl_pct
 
     async def close_position_fraction(self, pos: Dict[str, Any], fraction: float) -> bool:
