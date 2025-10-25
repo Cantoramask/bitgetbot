@@ -99,10 +99,10 @@ class Reasoner:
         Returns (allow, confidence, note, edge_bps, suggested_overrides)
 
         When disabled or unavailable it returns a conservative pass:
-        (True, 0.65, "disabled", 0.0, {}).
+        (True, 0.75, "disabled", 0.0, {}).
         """
         if not self.enabled or not self.client:
-            return True, 0.65, "disabled", 0.0, {}
+            return True, 0.75, "disabled", 0.0, {}
 
         fees_bps = float(snapshot.get("fees_bps", 6.0))
         slip_bps = float(snapshot.get("slip_bps", 1.0))
@@ -144,7 +144,7 @@ class Reasoner:
             if "trail_pct_tight" in overrides:
                 safe_overrides["trail_pct_tight"] = float(overrides["trail_pct_tight"])
             if "intelligence_sec" in overrides:
-                safe_overrides["intelligence_sec"] = float(overrides["intelligence_sec"])
+                safe_overrides["intelligence_sec"] = int(overrides["intelligence_sec"])
         except Exception:
             if self.log:
                 try:
@@ -177,7 +177,31 @@ class Reasoner:
         reason = "no_signal"
         trail_from_strategy = None
         caution = None
-...
+
+        # Strategy vote if available
+        try:
+            if strategy is not None:
+                side = strategy.decide_side() or "wait"
+                trail_from_strategy = getattr(strategy, "trail_pct", None)
+        except Exception:
+            side = "wait"
+
+        # Build snapshot for the LLM gate
+        snapshot = {
+            "side": side,
+            "trail_init": float(params.trail_pct_init),
+            "trail_tight": float(params.trail_pct_tight),
+            "intel_sec": int(params.intelligence_sec),
+            "lev": int(context.get("actual_leverage") or context.get("leverage") or 1),
+            "funding": context.get("funding"),
+            "open_interest": context.get("open_interest"),
+            "volatility": context.get("volatility"),
+            "fees_bps": float(context.get("fees_bps", 6.0)),
+            "slip_bps": float(context.get("slip_bps", 1.0)),
+        }
+
+        allow, confidence, note, edge_bps, ov = self.evaluate(snapshot)
+
         decision = {
             "allow": bool(allow),  # warn mode no longer forces allow=True
             "confidence": float(confidence),
@@ -186,6 +210,5 @@ class Reasoner:
             "suggested_overrides": ov,
         }
 
-        use_trail = float(trail_init) if trail_from_strategy is None else float(trail_from_strategy)
-        return side, ("advisor_warn" if not allow or confidence < 0.70 else reason), float(use_trail), decision
-
+        use_trail = float(params.trail_pct_init) if trail_from_strategy is None else float(trail_from_strategy)
+        return side, ("advisor_warn" if (not allow or confidence < 0.70) else reason), float(use_trail), decision
