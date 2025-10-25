@@ -267,12 +267,16 @@ class Orchestrator:
         try:
             while not self._stop.is_set():
                 await asyncio.sleep(self._params.intelligence_sec)
-                self._success_rate = self._clamp(self._success_rate + random.uniform(-0.03, 0.03), 0.1, 0.9)
+                self._success_rate = self._clamp(
+                    self._success_rate + random.uniform(-0.03, 0.03),
+                    0.1,
+                    0.9,
+                )
                 self._auto_tune_params()
         except asyncio.CancelledError:
             raise
- except Exception as e:
-        self.jlog.exception(e, where="intelligence")
+        except Exception as e:
+            self.jlog.exception(e, where="intelligence")
 
     async def _manage_position(self):
         try:
