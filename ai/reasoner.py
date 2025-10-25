@@ -35,6 +35,8 @@ class Reasoner:
             except Exception:
                 self.client = None
 
+        self.mode = os.getenv("ADVISOR_MODE", "warn").lower()
+
     def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[bool, float, str]:
         """
         Returns (allow, confidence, note).
@@ -44,9 +46,9 @@ class Reasoner:
             return True, 1.0, "disabled"
 
         policy = (
-            "Block if leverage is high and parameters are not tightened. "
+            "Never block a trade. If leverage is high and parameters are not tightened, lower confidence and add a caution note. "
             "Shorter intelligence_sec at higher leverage; smaller (tighter) trail percentages at higher leverage. "
-            "Consider funding and volatility; return cautious when mismatched."
+            "Consider funding and volatility; when mismatched, reduce confidence and add a caution."
         )
         prompt = (
             "You are a cautious trading gate. Reply as compact JSON with keys "
@@ -55,27 +57,24 @@ class Reasoner:
         )
 
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-            content = (resp.choices[0].message.content or "").strip()
-            try:
-                import json
-                data = json.loads(content)
-                allow = bool(data.get("allow", True))
-                conf = float(data.get("confidence", 0.75 if allow else 0.55))
-                note = str(data.get("note", ""))
-            except Exception:
-                low = content.lower()
-                allow = ("\"allow\": true" in low) or ("allow: true" in low) or ("allow\":true" in low)
-                conf = 0.75 if allow else 0.55
-                note = content
-            note_oneline = " ".join(str(note).split())[:300]
-            return allow, conf, note_oneline
-        except Exception as e:
-            return True, 1.0, f"advisor_error: {e}"
+            import json
+            data = json.loads(content)
+            allow = bool(data.get("allow", True))
+            conf = float(data.get("confidence", 0.75 if allow else 0.55))
+            note = str(data.get("note", ""))
+        except Exception:
+            low = content.lower()
+            allow = ("\"allow\": true" in low) or ("allow: true" in low) or ("allow\":true" in low)
+            conf = 0.75 if allow else 0.55
+            note = content
+
+        # override: never hard-block when ADVISOR_MODE=warn
+        if self.mode == "warn" and not allow:
+            allow = True
+            note = f"warn: {note}"
+
+        note_oneline = " ".join(str(note).split())[:300]
+        return allow, conf, note_oneline
 
     def decide(self, strategy, params, context: Dict[str, Any]):
         """
@@ -147,24 +146,18 @@ class Reasoner:
         }
         allow, confidence, note = self.evaluate(snap)
 
-        # New: honour allow == False as a hard block
+        # Never hard-block on allow=False. Treat as warn and continue.
         if not allow:
-            side = "wait"
-            reason = "advisor_block"
-            decision = {"allow": False, "confidence": float(confidence), "note": note}
-            use_trail = params.trail_pct_init if trail_from_strategy is None else float(trail_from_strategy)
-            return side, reason, float(use_trail), decision
+            reason = "advisor_warn"
+            decision = {"allow": True, "confidence": float(confidence), "note": f"warn: {note}"}
 
         # Existing hard block on very low confidence or explicit can't-manage phrasing
         txt = (note or "").lower()
         says_cant_manage = any(k in txt for k in ("cannot manage", "can't manage", "unmanageable", "do not trade", "do not proceed"))
         hard_block = (confidence < 0.30) or says_cant_manage
         if hard_block:
-            side = "wait"
-            reason = "advisor_block"
-            decision = {"allow": False, "confidence": float(confidence), "note": note}
-            use_trail = params.trail_pct_init if trail_from_strategy is None else float(trail_from_strategy)
-            return side, reason, float(use_trail), decision
+            reason = "advisor_warn"
+            decision = {"allow": True, "confidence": float(confidence), "note": f"warn: {note}"}
 
         # Warn-but-allow band: 0.30 <= confidence < 0.70
         if confidence < 0.70:
