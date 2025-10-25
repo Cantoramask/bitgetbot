@@ -578,13 +578,12 @@ class Orchestrator:
             raise
         except Exception as e:
             self.jlog.exception(e, where="manage_position")
-
     async def _heartbeat(self):
         try:
             hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "20")))
             while not self._stop.is_set():
-                st = self._snapshot()
-                ctx = self._context_block()
+                st = self._snapshot() or {}
+                ctx = self._context_block() or {}
                 st.update({
                     "funding": ctx.get("funding"),
                     "open_interest": ctx.get("open_interest"),
