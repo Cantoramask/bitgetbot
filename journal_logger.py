@@ -57,30 +57,40 @@ class JournalLogger:
             raise TypeError("logger must be a logging.Logger")
         self.log = logger
         self.jsonl = jsonl or JsonlJournal("events")
-        # Minimal mode hides noisy advisory or tuning chatter.
-        # Default to quiet unless explicitly turned off.
-        self.minimal = os.getenv("LOG_MINIMAL", "true").lower() in ("1", "true", "y", "yes")
 
-        # Throttle settings (seconds). You asked for ~30s unless an actual decision or major change is made.
+        # LOG_MODE controls console noise:
+        #   quiet  = default; suppress [DECIDE] unless side/reason actually changes
+        #   normal = show decisions, but still rate-limit and de-dup
+        #   debug  = show everything, minimal filtering
+        self.mode = os.getenv("LOG_MODE", "quiet").strip().lower()
+        if self.mode not in ("quiet", "normal", "debug"):
+            self.mode = "quiet"
+
+        # Keep legacy flag for compatibility; minimal is true in quiet mode.
+        self.minimal = self.mode == "quiet"
+
+        # Throttle settings (seconds). You asked for ~60s unless an actual change happens.
         try:
-            self.hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "30")))
+            self.hb_interval = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "60")))
         except Exception:
-            self.hb_interval = 30
+            self.hb_interval = 60
         try:
-            self.decide_interval = int(float(os.getenv("DECISION_INTERVAL_SEC", "20")))
+            self.decide_interval = int(float(os.getenv("DECISION_INTERVAL_SEC", "60")))
         except Exception:
-            self.decide_interval = 20
+            self.decide_interval = 60
 
         # Internal timers and last-signatures for de-duplication
         self._last_hb_ts: float = 0.0
         self._last_decide_ts: float = 0.0
         self._last_decide_sig: Optional[str] = None
+        self._last_decide_side: Optional[str] = None
+        self._last_decide_reason: Optional[str] = None
 
-        # New: throttle advisor spam the same way we do “wait” decisions
+        # Advisor throttling
         self._last_adv_ts: float = 0.0
         self._last_adv_sig: Optional[str] = None
 
-        # New: remember last heartbeat’s important fields to force-print on major change
+        # Heartbeat change detector
         self._last_hb_sig: Optional[str] = None
 
     # ------------
@@ -190,38 +200,65 @@ class JournalLogger:
         self._write("info", hb_msg, "heartbeat", fields)
 
     def decision(self, side: str, reason: str, trail_pct: float, cautions: Optional[str] = None) -> None:
-        # Minimal mode hides decision chatter entirely.
-        if self.minimal:
+        """
+        Console rules:
+          quiet  mode: only print if side changed or reason changed meaningfully.
+                       'wait' is rate-limited to one line per decide_interval.
+          normal mode: print, but de-dup within decide_interval and ignore tiny drift.
+          debug  mode: always print.
+
+        JSONL always records every call with full fields.
+        """
+        # Always write JSONL regardless of console suppression
+        cleaned_note = None
+        if isinstance(cautions, str):
+            cleaned_note = " ".join(cautions.split())
+            if len(cleaned_note) > 300:
+                cleaned_note = cleaned_note[:300]
+        self.jsonl.write("decision", {"level": "info", "side": side, "trail_pct": trail_pct, "reason": reason, "cautions": cleaned_note})
+
+        now = time.time()
+        if self.mode == "debug":
+            msg = f"[DECIDE] side={side} trail={trail_pct:.4%} why={reason}" + (f" note={cleaned_note}" if cleaned_note else "")
+            self._last_decide_ts = now
+            self._last_decide_sig = None
+            self._last_decide_side = side
+            self._last_decide_reason = reason
+            self.log.info(msg)
             return
 
-        # Keep the note short and one line for humans.
-        note = cautions
-        if isinstance(note, str):
-            note = " ".join(note.split())
-            if len(note) > 300:
-                note = note[:300]
-
-        # Signature is still useful when side is not "wait".
-        sig = f"{side}|{reason}|{round(trail_pct, 6)}|{note or ''}"
-        now = time.time()
+        # Decide if a console line is warranted
+        side_changed = (self._last_decide_side is None) or (side != self._last_decide_side)
+        reason_changed = (self._last_decide_reason is None) or (reason != self._last_decide_reason)
         is_wait = (side == "wait")
 
-        # Hard time-based throttle for "wait" to stop console spam regardless of content changes.
-        # If it's been less than decide_interval since the last decision line, suppress it.
-        if is_wait and (now - self._last_decide_ts) < max(1, self.decide_interval):
-            return
+        # In quiet mode, only speak if side or reason changed. Ignore trail for change detection.
+        if self.mode == "quiet":
+            should_print = side_changed or reason_changed
+            if is_wait:
+                # rate-limit 'wait' even if reason flip-flops; keep at most once per window
+                should_print = should_print and ((now - self._last_decide_ts) >= max(1, self.decide_interval))
+            if not should_print:
+                # update memory but keep quiet
+                self._last_decide_side = side
+                self._last_decide_reason = reason
+                return
 
-        # For non-wait decisions, still suppress exact duplicates within the interval.
-        if (not is_wait) and sig == self._last_decide_sig and (now - self._last_decide_ts) < max(1, self.decide_interval):
-            return
+        # In normal mode, print at most once per decide_interval unless side changes.
+        if self.mode == "normal":
+            if not side_changed and (now - self._last_decide_ts) < max(1, self.decide_interval):
+                self._last_decide_reason = reason
+                return
 
-        self._last_decide_sig = sig
+        # Emit the line (trail may show, but never triggers printing on its own)
+        msg = f"[DECIDE] side={side} trail={trail_pct:.4%} why={reason}" + (f" note={cleaned_note}" if cleaned_note else "")
         self._last_decide_ts = now
-        msg = f"[DECIDE] side={side} trail={trail_pct:.4%} why={reason}" + (f" note={note}" if note else "")
-        self._write("info", msg, "decision", {"side": side, "trail_pct": trail_pct, "reason": reason, "cautions": note})
+        self._last_decide_side = side
+        self._last_decide_reason = reason
+        self.log.info(msg)
 
     def knob_change(self, name: str, old: Any, new: Any, why: str) -> None:
-        if self.minimal:
+        if self.minimal and self.mode != "debug":
             return
         msg = f"[KNOB] {name}: {old} -> {new} ({why})"
         self._write("info", msg, "knob_change", {"name": name, "old": old, "new": new, "why": why})
@@ -254,11 +291,10 @@ class JournalLogger:
         self._write("info", msg, "partial_close", {"symbol": symbol, "side": side, "fraction": fraction, "r_mult": at_r, "price": price, "reason": reason})
 
     def advisor(self, allow: bool, confidence: float, note: Optional[str] = None) -> None:
-        # Quiet by default. If you need full advisor chatter, set LOG_MINIMAL=false.
-        if self.minimal:
+        # Quiet by default. If you need full advisor chatter, set LOG_MODE=normal or debug.
+        if self.minimal and self.mode != "debug":
             return
 
-        # Build a signature that captures meaningfully different advisor outputs.
         cleaned_note = None
         if isinstance(note, str):
             cleaned_note = " ".join(note.split())
